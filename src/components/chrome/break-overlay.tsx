@@ -106,8 +106,15 @@ export function BreakOverlay({
   // Element focused before the overlay opened, restored on close.
   const previouslyFocused = useRef<HTMLElement | null>(null);
   const completedRef = useRef(false);
+  // Latest-callback ref so the completion effect below doesn't re-run (and
+  // re-fire) every time the parent passes a new inline function. Synced in an
+  // effect rather than during render: mutating a ref while rendering is not
+  // allowed, and the completion check that reads it is itself an effect, so it
+  // always sees the value committed alongside this one.
   const onCompleteRef = useRef(onComplete);
-  onCompleteRef.current = onComplete;
+  useEffect(() => {
+    onCompleteRef.current = onComplete;
+  }, [onComplete]);
   const titleId = useId();
 
   const reduceMotion = useReducedMotion();

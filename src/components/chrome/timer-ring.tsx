@@ -74,23 +74,30 @@ export function TimerRing({
   const explicitStart = toMs(startedAt);
   const countdown = endMs !== undefined;
 
-  // Null until mounted, so the server and the first client render agree on the
-  // arc. Reads fall back to the start anchor, i.e. a ring that hasn't moved.
+  // Both null until mounted, so the server and the first client render agree
+  // on the arc. Reads fall back to the start anchor, i.e. a ring that hasn't
+  // moved yet.
+  //
+  // The anchor is state rather than a ref on purpose: it is read during render
+  // to size the arc, and a ref read during render makes the output depend on
+  // mutable data React isn't tracking — which tears under concurrent
+  // rendering. `doneRef` below stays a ref because it is only ever touched
+  // inside effects.
   const [now, setNow] = useState<number | null>(null);
-  const startRef = useRef<number | undefined>(explicitStart);
+  const [anchor, setAnchor] = useState<number | undefined>(explicitStart);
   const doneRef = useRef(false);
 
   useEffect(() => {
     if (!countdown) return;
     const t = Date.now();
-    startRef.current = explicitStart ?? t;
+    setAnchor(explicitStart ?? t);
     doneRef.current = false;
     setNow(t);
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, [countdown, explicitStart, endMs]);
 
-  const start = startRef.current ?? endMs ?? 0;
+  const start = anchor ?? endMs ?? 0;
   const clock = now ?? start;
 
   useEffect(() => {
