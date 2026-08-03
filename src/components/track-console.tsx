@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
-import { Play, Square, Plus, Settings2, Volume2, Bell } from "lucide-react";
+import { Play, Square, Plus, Settings2, Volume2, Bell, X } from "lucide-react";
 import Select from "@/components/chrome/select";
 import { Input } from "@/components/chrome/input";
 import { Textarea } from "@/components/chrome/textarea";
@@ -14,7 +14,7 @@ import { ToastProvider, useToast } from "@/components/chrome/toast";
 import { useBreakAlarm } from "@/hooks/use-break-alarm";
 import type { CalendarActual } from "@/lib/calendar";
 import type { CalendarCategory } from "@/lib/calendar-categories";
-import { MAX_TRACK } from "@/lib/calendar-constants";
+import { MAX_TRACK, PRIMARY_TRACK } from "@/lib/calendar-constants";
 import { segmentLane, startLane, stopAllLanes, stopLane } from "@/app/actions";
 import { cn } from "@/lib/utils";
 
@@ -215,11 +215,37 @@ function Console({
     });
   };
 
-  const canAddLane = openLanes.length <= MAX_TRACK && Math.max(...openLanes) < MAX_TRACK;
+  // Lowest free slot rather than max+1: closing lane 1 and adding again should
+  // hand back lane 1, not march toward the cap leaving holes behind. Lane
+  // numbers are concurrency slots, not identities — nothing about "lane 1"
+  // carries meaning across sessions, so reusing one is free.
+  const nextFreeLane = (() => {
+    for (let t = PRIMARY_TRACK; t <= MAX_TRACK; t++) if (!openLanes.includes(t)) return t;
+    return null;
+  })();
+
+  const canAddLane = nextFreeLane !== null;
   const addLane = () => {
-    const next = Math.max(...openLanes) + 1;
-    if (next > MAX_TRACK) return;
-    setOpenLanes((l) => [...l, next]);
+    if (nextFreeLane === null) return;
+    setOpenLanes((l) => [...l, nextFreeLane].sort((a, b) => a - b));
+  };
+
+  /**
+   * Closes an idle lane. Only ever offered for a lane with nothing running:
+   * removing a lane that holds a live entry would leave that row ticking in
+   * the database with no card left to stop it from. Lane 0 is permanent —
+   * it's the primary lane and the console needs somewhere to start.
+   */
+  const removeLane = (track: number) => {
+    if (track === PRIMARY_TRACK || runningOn(track)) return;
+    setOpenLanes((l) => l.filter((t) => t !== track));
+    // Drop the draft too, so a lane re-opened on this slot starts clean
+    // instead of inheriting what was typed into the last one.
+    setDrafts((d) => {
+      const next = { ...d };
+      delete next[track];
+      return next;
+    });
   };
 
   return (
@@ -247,10 +273,10 @@ function Console({
                 variant="outline"
                 size="sm"
                 className="mt-3"
+                icon={Square}
                 onClick={handleStopAll}
                 disabled={pending}
               >
-                <Square aria-hidden className="size-3.5" />
                 end session
               </Button>
             )}
@@ -293,10 +319,10 @@ function Console({
                     <Button
                       variant="outline"
                       size="sm"
+                      icon={Square}
                       onClick={() => handleStop(running.id)}
                       disabled={pending}
                     >
-                      <Square aria-hidden className="size-3.5" />
                       stop
                     </Button>
                   </>
@@ -322,21 +348,42 @@ function Console({
                     <Button
                       variant="solid"
                       size="sm"
+                      icon={Play}
                       onClick={() => handleStart(track)}
                       disabled={pending}
                     >
-                      <Play aria-hidden className="size-3.5" />
                       start
                     </Button>
                   </>
+                )}
+
+                {/* Idle non-primary lanes can be closed. A running lane shows
+                    no close button — stop it first, so the entry it holds is
+                    logged rather than stranded. */}
+                {!running && track !== PRIMARY_TRACK && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    icon={X}
+                    label={`close lane ${track}`}
+                    tooltip="close lane"
+                    onClick={() => removeLane(track)}
+                    disabled={pending}
+                    className="self-end text-white/30 hover:text-white sm:self-auto"
+                  />
                 )}
               </div>
             );
           })}
 
           {canAddLane && (
-            <Button variant="dashed" size="sm" onClick={addLane} className="self-start">
-              <Plus aria-hidden className="size-3.5" />
+            <Button
+              variant="dashed"
+              size="sm"
+              icon={Plus}
+              onClick={addLane}
+              className="self-start"
+            >
               add a parallel lane
             </Button>
           )}
@@ -369,13 +416,13 @@ function Console({
             <Button
               variant={alarm.settings.sound ? "solid" : "outline"}
               size="sm"
+              icon={Volume2}
               onClick={() => {
                 const next = !alarm.settings.sound;
                 alarm.setSettings({ sound: next });
                 if (next) alarm.testChime();
               }}
             >
-              <Volume2 aria-hidden className="size-3.5" />
               {alarm.settings.sound ? "sound on" : "sound off"}
             </Button>
 
@@ -387,12 +434,12 @@ function Console({
                     : "outline"
                 }
                 size="sm"
+                icon={Bell}
                 onClick={async () => {
                   if (alarm.notifyPermission !== "granted") await alarm.requestNotify();
                   alarm.setSettings({ notify: !alarm.settings.notify });
                 }}
               >
-                <Bell aria-hidden className="size-3.5" />
                 {alarm.notifyPermission === "denied"
                   ? "notifications blocked"
                   : alarm.settings.notify && alarm.notifyPermission === "granted"
