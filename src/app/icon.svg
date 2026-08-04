@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="hours">
+  <!--
+    hours.justin06lee.dev — an hourglass, drawn to the house rules: pure black
+    ground, white mark, square corners, no stroke and no curve anywhere.
+
+    SOLID, NOT OUTLINED. The obvious richer version draws the upper bulb as an
+    outline and fills only the lower one, so the mark reads "time already
+    poured in" — the site's own tagline. It was drawn and rejected: at 16px a
+    2-unit stroke lands on a single pixel, the upper bulb turns to grey mush,
+    and the silhouette stops being an hourglass at exactly the size the browser
+    tab uses. A mark that only works enlarged is not a favicon.
+
+    GEOMETRY: every horizontal edge sits on an even coordinate, so a 32 to 16
+    halving lands on whole pixels and nothing anti-aliases. Not pedantry — the
+    first cut put the plates at y=3 with height 3, which is 1.5px at 16 and
+    rendered them as grey bars rather than white ones.
+
+    The one exception is the waist (x 15..17), which cannot be both 2 units
+    wide and centred, since 16 is the centre line. It softens to a single pixel
+    at 16px, which reads as the pinch it already is. Widening it to 4 units
+    aligns it and costs the proportion: the mark starts reading as a bowtie
+    once it is bigger than a tab.
+
+    SEAMS: abutting shapes anti-alias against each other and leave a hairline
+    of background showing through, which is visible on the 180px Apple icon as
+    a crease where each plate meets its bulb. So the bulbs and the waist each
+    overrun their neighbour by one unit. The overlap is invisible — it is white
+    on white — and only the outer silhouette edges (y=2 and y=30) are load
+    bearing, which is why those stay on even coordinates.
+
+    Content spans y 2..30, centred. The mark is vertically symmetric, so it
+    needs no optical correction.
+  -->
+  <rect width="32" height="32" fill="#000000"/>
+
+  <g fill="#ffffff">
+    <!-- Plates, top and bottom. -->
+    <rect x="6" y="2" width="20" height="4"/>
+    <rect x="6" y="26" width="20" height="4"/>
+
+    <!-- Upper bulb, tapering to the waist. Starts at y=5, one unit up inside
+         the plate, to close the seam. -->
+    <polygon points="8,5 24,5 17,15 15,15"/>
+
+    <!-- The waist itself: a real 2-unit neck rather than two triangles meeting
+         at a corner, so the halves stay visibly joined at 16px. Runs y 14..18
+         so it overlaps both bulbs. -->
+    <rect x="15" y="14" width="2" height="4"/>
+
+    <!-- Lower bulb, opening back out and running one unit into its plate. -->
+    <polygon points="15,17 17,17 24,27 8,27"/>
+  </g>
+</svg>

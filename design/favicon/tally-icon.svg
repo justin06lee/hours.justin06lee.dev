@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="hours">
+  <!--
+    hours.justin06lee.dev — optical size for 32px and below: the favicon and
+    the browser tab strip. Same mark as icon.svg, the split Exchequer tally.
+    See that file for the full citation and sourcing.
+
+    WHAT CHANGED, AND WHY: a 512px drawing rendered at 16px is mud, so this is
+    redrawn rather than resized.
+      - Four notches down to two. The narrowest notch in icon.svg is 24 of 512,
+        which lands at 0.75px here and dissolves into grey.
+      - The two remaining notches keep unequal widths (8 and 6), because the
+        descending denominations are the authentic detail and dropping to
+        equal notches would make it decorative.
+      - Notches bite halfway into each half rather than a third, and the sticks
+        are thicker, so the interlock survives the downscale.
+
+    GEOMETRY: every edge sits on an even coordinate, so a 32 to 16 halving
+    lands on whole pixels and nothing anti-aliases. Halves are 8 deep with a
+    4 gap between them: at 16px that is a 4px stick, a 2px split, and a 2px
+    notch — each the minimum that still reads. Content spans y 6..26, centred,
+    since this mark is vertically symmetric and needs no optical correction.
+  -->
+  <rect width="32" height="32" fill="#000000"/>
+
+  <!-- The two halves: the stock, and the foil. -->
+  <g fill="#ffffff">
+    <rect x="2" y="6" width="28" height="8"/>
+    <rect x="2" y="18" width="28" height="8"/>
+  </g>
+
+  <!-- The notches, meeting across the split. -->
+  <g fill="#000000">
+    <rect x="6" y="10" width="8" height="4"/>
+    <rect x="6" y="18" width="8" height="4"/>
+    <rect x="18" y="10" width="6" height="4"/>
+    <rect x="18" y="18" width="6" height="4"/>
+  </g>
+</svg>
