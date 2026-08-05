@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
 import { Play, Square, Plus, Settings2, Volume2, Bell, X } from "lucide-react";
 import Select from "@/components/chrome/select";
 import { Input } from "@/components/chrome/input";
@@ -19,6 +20,11 @@ import { segmentLanes, startLane, startLanes, stopAllLanes, stopLane } from "@/a
 import { cn } from "@/lib/utils";
 
 type Draft = { categoryId: string; title: string };
+
+/** Same selector BreakOverlay traps with — kept identical so the two dialogs
+ *  agree on what counts as focusable. */
+const FOCUSABLE =
+  'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
 
 /** What the "what did you do?" dialog collects, per running lane. */
 type Segment = { id: string; track: number; categoryId: string | null; title: string | null };
@@ -44,15 +50,38 @@ function Console({
   const [lanes, setLanes] = useState<CalendarActual[]>(initialLanes);
   const [pending, startTransition] = useTransition();
   const { toast } = useToast();
+  const router = useRouter();
 
-  // Lanes the user has opened but not started yet. Lane 0 always exists.
-  const [openLanes, setOpenLanes] = useState<number[]>(() => {
-    const running = initialLanes.map((l) => l.track);
-    return running.length > 0 ? [...new Set([0, ...running])].sort((a, b) => a - b) : [0];
-  });
+  // Lanes the user opened by hand, seeded with whatever was already running at
+  // first render. Only the user's choices live here — running lanes are unioned
+  // in below instead, so this stays a list of empty cards to offer, and a lane
+  // the user started here keeps its card after it stops.
+  const [manualLanes, setManualLanes] = useState<number[]>(() => [
+    PRIMARY_TRACK,
+    ...initialLanes.map((l) => l.track),
+  ]);
   const [drafts, setDrafts] = useState<Record<number, Draft>>({});
 
   const anyRunning = lanes.length > 0;
+
+  /**
+   * Which lane cards to render: everything running, plus everything the user
+   * opened, plus the primary lane.
+   *
+   * Derived rather than stored because `lanes` is the only channel through
+   * which server truth reaches this component. Lanes can be started from the
+   * sibling site against the same database, and a revalidate re-renders the
+   * server component but cannot reseed a `useState` initialiser — so a stored
+   * list left a lane running with no card and no way to stop it short of
+   * ending the whole session.
+   */
+  const openLanes = useMemo(
+    () =>
+      [...new Set([PRIMARY_TRACK, ...manualLanes, ...lanes.map((l) => l.track)])].sort(
+        (a, b) => a - b,
+      ),
+    [manualLanes, lanes],
+  );
 
   // The alarm has fired: collect descriptions before anything is closed.
   const [prompting, setPrompting] = useState<Segment[] | null>(null);
@@ -60,19 +89,23 @@ function Console({
   const [onBreak, setOnBreak] = useState(false);
   const [resumeAfterBreak, setResumeAfterBreak] = useState<Segment[]>([]);
 
-  const active = categories.filter((c) => !c.archived);
+  // The archived filter lives inside the memo: as a separate `const` it was a
+  // fresh array every render and the sole dependency here, so the memo never
+  // held and `Select` was handed a new `options` identity each time.
   const options = useMemo(
     () => [
       { value: "", label: "no subject" },
-      ...active.map((c) => ({
-        value: c.id,
-        label: c.name.toLowerCase(),
-        prefix: (
-          <span aria-hidden className="size-2 shrink-0" style={{ background: c.color }} />
-        ),
-      })),
+      ...categories
+        .filter((c) => !c.archived)
+        .map((c) => ({
+          value: c.id,
+          label: c.name.toLowerCase(),
+          prefix: (
+            <span aria-hidden className="size-2 shrink-0" style={{ background: c.color }} />
+          ),
+        })),
     ],
-    [active],
+    [categories],
   );
 
   const colorOf = useMemo(
@@ -102,38 +135,68 @@ function Console({
     [toast],
   );
 
+  /**
+   * The failure `apply` cannot see. Every lane action re-checks admin, and that
+   * check *throws* rather than returning `{ok:false}` — so an expired session
+   * rejects the promise instead of returning an error. React hands a rejection
+   * inside a transition to `reportGlobalError` and settles the transition
+   * quietly: `pending` drops back to false, no toast, and the card still offers
+   * a button that will never work again. Every call site therefore catches, and
+   * `refresh()` re-runs the page's own admin gate, which redirects to /login.
+   */
+  const onActionFailed = useCallback(() => {
+    toast({
+      title: "session expired",
+      description: "sign in again to keep tracking.",
+      variant: "danger",
+    });
+    router.refresh();
+  }, [router, toast]);
+
   const handleStart = (track: number) => {
     const d = draftFor(track);
     startTransition(async () => {
-      const result = await startLane({
-        track,
-        categoryId: d.categoryId || null,
-        title: d.title.trim() || null,
-      });
-      if (!apply(result)) return;
-      toast({ title: `lane ${track} started`, variant: "success" });
-      // Only the first lane starts the clock; opening a second lane mid-stretch
-      // must not push the break further away.
-      if (alarm.deadline === null) alarm.arm();
+      try {
+        const result = await startLane({
+          track,
+          categoryId: d.categoryId || null,
+          title: d.title.trim() || null,
+        });
+        if (!apply(result)) return;
+        toast({ title: `lane ${track} started`, variant: "success" });
+        // Only the first lane starts the clock; opening a second lane mid-stretch
+        // must not push the break further away.
+        if (alarm.deadline === null) alarm.arm();
+      } catch {
+        onActionFailed();
+      }
     });
   };
 
   const handleStop = (id: string) => {
     startTransition(async () => {
-      const result = await stopLane({ id });
-      if (!apply(result)) return;
-      toast({ title: "logged", variant: "success" });
-      // Last lane down ends the session, so stop counting toward a break.
-      if (result.lanes.length === 0) alarm.disarm();
+      try {
+        const result = await stopLane({ id });
+        if (!apply(result)) return;
+        toast({ title: "logged", variant: "success" });
+        // Last lane down ends the session, so stop counting toward a break.
+        if (result.lanes.length === 0) alarm.disarm();
+      } catch {
+        onActionFailed();
+      }
     });
   };
 
   const handleStopAll = () => {
     startTransition(async () => {
-      const ok = apply(await stopAllLanes());
-      if (ok) {
-        alarm.disarm();
-        toast({ title: "session ended", variant: "success" });
+      try {
+        const ok = apply(await stopAllLanes());
+        if (ok) {
+          alarm.disarm();
+          toast({ title: "session ended", variant: "success" });
+        }
+      } catch {
+        onActionFailed();
       }
     });
   };
@@ -176,21 +239,117 @@ function Console({
   const submitSegments = () => {
     const segments = prompting ?? [];
     startTransition(async () => {
-      const result = await segmentLanes(
-        segments.map((seg) => ({
-          ...seg,
-          notes: descriptions[seg.id]?.trim() || null,
-          // resume:false — the break happens between chunks, not during one.
-          resume: false,
-        })),
-      );
-      if (!apply(result)) return;
-      setPrompting(null);
-      setDescriptions({});
-      setResumeAfterBreak(segments);
-      setOnBreak(true);
+      try {
+        const result = await segmentLanes(
+          segments.map((seg) => ({
+            ...seg,
+            notes: descriptions[seg.id]?.trim() || null,
+            // resume:false — the break happens between chunks, not during one.
+            resume: false,
+          })),
+        );
+        if (!apply(result)) return;
+        setPrompting(null);
+        setDescriptions({});
+        setResumeAfterBreak(segments);
+        setOnBreak(true);
+      } catch {
+        // The dialog deliberately stays up: nothing was written, so the answers
+        // typed into it are still worth something once the user signs in again.
+        onActionFailed();
+      }
     });
   };
+
+  /**
+   * Leave the dialog without answering it — the skip button, escape, and a
+   * click on the backdrop.
+   *
+   * Nothing has been written at this point: the dialog collects descriptions
+   * *before* any lane is closed, so skipping means "keep working". The lanes
+   * stay running, no break is taken, and `acknowledge` re-arms so the next
+   * stretch is timed from now — leaving the alarm fired with a deadline in the
+   * past would park the ring at zero for the rest of the session.
+   *
+   * Plain function rather than useCallback for the same reason as `endBreak`
+   * below: the alarm object is a fresh literal each render, so a manual memo
+   * over it can never hold.
+   */
+  const dismissPrompt = () => {
+    setPrompting(null);
+    setDescriptions({});
+    alarm.acknowledge();
+  };
+
+  // Everything `aria-modal` on the dialog below claims but never did, mirroring
+  // BreakOverlay: focus moves in on open and back out on close, Tab is trapped,
+  // escape dismisses, and the page behind stops scrolling.
+  const promptOpen = prompting !== null;
+  const promptRef = useRef<HTMLDivElement>(null);
+  // Element focused before the dialog opened, restored on close.
+  const promptReturnFocus = useRef<HTMLElement | null>(null);
+  // Latest-callback ref so the key handler below subscribes once per opening
+  // rather than once per render — `dismissPrompt` closes over the alarm, which
+  // is a new object every time. Synced in an effect because a ref cannot be
+  // mutated during render, and the handler that reads it only runs after commit.
+  const dismissPromptRef = useRef(dismissPrompt);
+  useEffect(() => {
+    dismissPromptRef.current = dismissPrompt;
+  });
+
+  useEffect(() => {
+    if (!promptOpen) return;
+    promptReturnFocus.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const panel = promptRef.current;
+    const focusables = panel?.querySelectorAll<HTMLElement>(FOCUSABLE);
+    (focusables && focusables.length > 0 ? focusables[0] : panel)?.focus();
+    return () => {
+      promptReturnFocus.current?.focus();
+      promptReturnFocus.current = null;
+    };
+  }, [promptOpen]);
+
+  useEffect(() => {
+    if (!promptOpen) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        dismissPromptRef.current();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const panel = promptRef.current;
+      if (!panel) return;
+      const focusables = panel.querySelectorAll<HTMLElement>(FOCUSABLE);
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey) {
+        if (active === first || !panel.contains(active)) {
+          e.preventDefault();
+          last?.focus();
+        }
+      } else if (active === last || !panel.contains(active)) {
+        e.preventDefault();
+        first?.focus();
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [promptOpen]);
+
+  // Restore the previous value rather than clearing it, so a lock held by
+  // something outer survives ours.
+  useEffect(() => {
+    if (!promptOpen) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, [promptOpen]);
 
   /**
    * Break over: reopen every lane that was running before it.
@@ -210,18 +369,22 @@ function Console({
       return;
     }
     startTransition(async () => {
-      // One POST for every lane, same as submitSegments. The old loop also
-      // swallowed per-lane failures silently; `apply` surfaces them, which
-      // matters more now that a failure means nothing resumed at all.
-      const result = await startLanes(
-        toResume.map((seg) => ({
-          track: seg.track,
-          categoryId: seg.categoryId,
-          title: seg.title,
-        })),
-      );
-      if (!apply(result)) return;
-      toast({ title: "back at it", variant: "success" });
+      try {
+        // One POST for every lane, same as submitSegments. The old loop also
+        // swallowed per-lane failures silently; `apply` surfaces them, which
+        // matters more now that a failure means nothing resumed at all.
+        const result = await startLanes(
+          toResume.map((seg) => ({
+            track: seg.track,
+            categoryId: seg.categoryId,
+            title: seg.title,
+          })),
+        );
+        if (!apply(result)) return;
+        toast({ title: "back at it", variant: "success" });
+      } catch {
+        onActionFailed();
+      }
     });
   };
 
@@ -237,7 +400,8 @@ function Console({
   const canAddLane = nextFreeLane !== null;
   const addLane = () => {
     if (nextFreeLane === null) return;
-    setOpenLanes((l) => [...l, nextFreeLane].sort((a, b) => a - b));
+    // No sort here: `openLanes` orders the union.
+    setManualLanes((l) => [...l, nextFreeLane]);
   };
 
   /**
@@ -248,7 +412,7 @@ function Console({
    */
   const removeLane = (track: number) => {
     if (track === PRIMARY_TRACK || runningOn(track)) return;
-    setOpenLanes((l) => l.filter((t) => t !== track));
+    setManualLanes((l) => l.filter((t) => t !== track));
     // Drop the draft too, so a lane re-opened on this slot starts clean
     // instead of inheriting what was typed into the last one.
     setDrafts((d) => {
@@ -446,7 +610,26 @@ function Console({
                 size="sm"
                 icon={Bell}
                 onClick={async () => {
-                  if (alarm.notifyPermission !== "granted") await alarm.requestNotify();
+                  // Two different questions wear one button. `notify` defaults
+                  // to true, so while permission is missing it is never what is
+                  // blocking notifications — inverting it on the click that
+                  // grants permission writes false and leaves the alarm silent
+                  // until a second click. Granting therefore *sets* rather than
+                  // toggles; only an already-granted click is a real toggle.
+                  if (alarm.notifyPermission !== "granted") {
+                    await alarm.requestNotify();
+                    // requestNotify only pushes the answer into hook state,
+                    // which this closure cannot see until the next render, so
+                    // read the browser's value directly. Denied or dismissed:
+                    // leave `notify` alone and let the label say "blocked".
+                    if (
+                      typeof Notification !== "undefined" &&
+                      Notification.permission === "granted"
+                    ) {
+                      alarm.setSettings({ notify: true });
+                    }
+                    return;
+                  }
                   alarm.setSettings({ notify: !alarm.settings.notify });
                 }}
               >
@@ -464,12 +647,22 @@ function Console({
       {/* "what did you do?" — asked before anything is written. */}
       {prompting && (
         <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="segment-title"
+          // mousedown, not click: a drag that starts inside the panel and ends
+          // on the backdrop (selecting text in a textarea) fires click here,
+          // and losing what was typed to that is exactly the wrong outcome.
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) dismissPrompt();
+          }}
           className="fixed inset-0 z-40 flex items-center justify-center bg-black/80 p-4"
         >
-          <div className="max-h-[85dvh] w-full max-w-lg overflow-y-auto border border-white/20 bg-[#0a0a0a] p-6">
+          <div
+            ref={promptRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="segment-title"
+            tabIndex={-1}
+            className="max-h-[85dvh] w-full max-w-lg overflow-y-auto border border-white/20 bg-[#0a0a0a] p-6"
+          >
             <h2
               id="segment-title"
               className="font-mono text-[11px] uppercase tracking-[0.18em] text-white/40"
@@ -509,6 +702,12 @@ function Console({
             </div>
 
             <div className="mt-6 flex justify-end gap-2">
+              {/* Not disabled while pending: the reason to reach for it is a
+                  submit that already failed, and a dialog with no way out is
+                  the defect being fixed. */}
+              <Button variant="ghost" onClick={dismissPrompt}>
+                skip, keep working
+              </Button>
               <Button variant="solid" onClick={submitSegments} disabled={pending}>
                 log it and break
               </Button>
