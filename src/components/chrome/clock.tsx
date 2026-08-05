@@ -111,6 +111,10 @@ export function Clock({
   const smooth = sweep && variant !== "digital" && showSeconds;
 
   useEffect(() => {
+    // Seeding the clock is the whole point of this effect: `now` is null through
+    // the server render and hydration so both emit identical markup, and only a
+    // post-mount write can be the real time. Not a cascading render to remove.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setNow(Date.now());
 
     if (smooth && !prefersReducedMotion()) {
@@ -142,10 +146,20 @@ export function Clock({
   const time = now === null ? ZERO : readClock(timeFmt, now);
   const readout = formatDigital(time, hour12, showSeconds);
 
-  const zone =
-    zoneFmt
-      ?.formatToParts(new Date(now ?? 0))
-      .find((p) => p.type === "timeZoneName")?.value ?? null;
+  // The abbreviation can only change at a DST boundary, so key the Intl call to
+  // the whole minute: under `sweep` this render runs ~60×/s and formatToParts is
+  // the expensive part of the frame. Null before the first tick — formatting
+  // epoch 0 would paint the wrong side of a DST boundary for one frame.
+  const zoneMinute = now === null ? null : Math.floor(now / 60000);
+  const zone = useMemo(
+    () =>
+      zoneFmt && zoneMinute !== null
+        ? zoneFmt
+            .formatToParts(new Date(zoneMinute * 60000))
+            .find((p) => p.type === "timeZoneName")?.value ?? null
+        : null,
+    [zoneFmt, zoneMinute],
+  );
 
   // Fractional minutes/hours keep the small hands off the tick marks between
   // steps, which is what makes an analog face read as continuous.

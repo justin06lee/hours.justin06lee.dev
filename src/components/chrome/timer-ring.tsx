@@ -37,10 +37,6 @@ export type TimerRingProps = {
 const toMs = (v: number | Date | undefined) =>
   v === undefined ? undefined : v instanceof Date ? v.getTime() : v;
 
-const prefersReducedMotion = () =>
-  typeof window !== "undefined" &&
-  window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
-
 /** `mm:ss` under an hour, `h:mm:ss` above it. Clamped at zero. */
 export function formatRemaining(ms: number): string {
   const total = Math.max(0, Math.ceil(ms / 1000));
@@ -90,10 +86,21 @@ export function TimerRing({
   useEffect(() => {
     if (!countdown) return;
     const t = Date.now();
+    // The clock has to be seeded here rather than in the initializer: a
+    // Date.now() read during render happens once on the server and again at
+    // hydration, and the two never agree.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setAnchor(explicitStart ?? t);
     doneRef.current = false;
     setNow(t);
-    const id = setInterval(() => setNow(Date.now()), 1000);
+    const id = setInterval(() => {
+      const tick = Date.now();
+      setNow(tick);
+      // Hosts commonly leave `endsAt` in place after the deadline fires, so
+      // nothing else would ever tear this down — it would keep re-rendering an
+      // unchanged 00:00 once a second for the life of the page.
+      if (tick >= endMs) clearInterval(id);
+    }, 1000);
     return () => clearInterval(id);
   }, [countdown, explicitStart, endMs]);
 
@@ -127,11 +134,15 @@ export function TimerRing({
   // A countdown steps once a second, so the arc is interpolated across almost
   // the whole second to read as continuous motion; a controlled value gets a
   // short settle instead.
-  const transition = prefersReducedMotion()
-    ? undefined
-    : countdown
-      ? "stroke-dashoffset 900ms linear"
-      : "stroke-dashoffset 300ms cubic-bezier(0.16, 1, 0.3, 1)";
+  //
+  // Expressed as classes rather than an inline style so the reduced-motion
+  // opt-out is `motion-reduce:transition-none` — a media query the browser
+  // resolves. Reading matchMedia during render instead would make the server
+  // (which always sees "no preference") disagree with a reduced-motion client
+  // at hydration.
+  const transitionClass = countdown
+    ? "transition-[stroke-dashoffset] duration-[900ms] ease-linear motion-reduce:transition-none"
+    : "transition-[stroke-dashoffset] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] motion-reduce:transition-none";
 
   const percent = Math.round(fraction * 100);
   const center =
@@ -141,10 +152,14 @@ export function TimerRing({
         ? formatRemaining(remaining)
         : `${percent}%`;
 
+  // Hosts rarely pass a name, and an unnamed progressbar is announced as a
+  // bare "progress bar" with no hint of what it is measuring.
+  const name = ariaLabel ?? (countdown ? "countdown" : "progress");
+
   return (
     <div
       role="progressbar"
-      aria-label={ariaLabel}
+      aria-label={name}
       aria-valuemin={0}
       aria-valuemax={countdown ? 100 : max}
       aria-valuenow={countdown ? percent : value}
@@ -173,7 +188,7 @@ export function TimerRing({
           strokeDashoffset={circumference * (1 - shown)}
           // Dash offsets start at 3 o'clock; rotate the arc's origin to 12.
           transform={`rotate(-90 ${size / 2} ${size / 2})`}
-          style={{ transition }}
+          className={transitionClass}
         />
       </svg>
       {center !== null && center !== undefined && (

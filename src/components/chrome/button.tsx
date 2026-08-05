@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -37,7 +37,12 @@ export type ButtonProps = {
   copy?: string;
   /** Swaps into tooltip (and into children if children is a string) for 1.5s after copy. Defaults to "Copied!". */
   copyFeedback?: string;
-  ref?: React.Ref<HTMLButtonElement | HTMLAnchorElement>;
+  /**
+   * Typed to HTMLElement because the rendered element depends on the props: an
+   * <a> with `href`, otherwise a <button>. Promising either one specifically
+   * would let a caller be told it holds a <button> while an <a> is in there.
+   */
+  ref?: React.Ref<HTMLElement>;
 };
 
 const SIZE = {
@@ -84,6 +89,18 @@ export function Button({
     };
   }, []);
 
+  // React's ref props are invariant, so a Ref<HTMLElement> can't be handed
+  // straight to <a> or <button>; forwarding through a callback keeps the node
+  // flowing to the caller without a cast that lies about its type. Stable
+  // identity so React doesn't detach and re-attach it on every render.
+  const setRef = useCallback(
+    (node: HTMLElement | null) => {
+      if (typeof ref === "function") return ref(node);
+      if (ref) ref.current = node;
+    },
+    [ref],
+  );
+
   const iconOnly = !children;
   const isLink = variant === "link";
   const hasIcon = Boolean(Icon || IconRight);
@@ -129,8 +146,18 @@ export function Button({
   const content = (
     <>
       {tooltipShown && (
-        <span aria-hidden className="pointer-events-none absolute bottom-full left-1/2 z-10 whitespace-nowrap bg-white px-2 py-1 text-[11px] text-black opacity-0 [transform:translate(-50%,4px)] transition-[opacity,transform] duration-150 group-hover:opacity-100 group-hover:[transform:translate(-50%,-4px)]">
+        <span aria-hidden className="pointer-events-none absolute bottom-full left-1/2 z-10 whitespace-nowrap bg-white px-2 py-1 text-[11px] text-black opacity-0 [transform:translate(-50%,4px)] transition-[opacity,transform] duration-150 group-hover:opacity-100 group-hover:[transform:translate(-50%,-4px)] group-focus-visible:opacity-100 group-focus-visible:[transform:translate(-50%,-4px)]">
           {tooltipShown}
+        </span>
+      )}
+      {/* The tooltip is decorative, so the copy result needs its own live
+          region — mounted empty from the start, since a region that appears
+          together with its text isn't announced. Skipped when `children` is a
+          string: the visible text already swaps to the feedback, which changes
+          the accessible name and gets announced on its own. */}
+      {copy && typeof children !== "string" && (
+        <span role="status" className="sr-only">
+          {showFeedback ? copyFeedback : ""}
         </span>
       )}
       {Icon && <Icon size={iconPx} aria-hidden />}
@@ -152,7 +179,7 @@ export function Button({
       const LinkComp = linkComponent;
       return (
         <LinkComp
-          ref={ref}
+          ref={setRef}
           href={href}
           aria-label={ariaLabel}
           className={cls}
@@ -165,7 +192,7 @@ export function Button({
     }
     return (
       <a
-        ref={ref as React.Ref<HTMLAnchorElement>}
+        ref={setRef}
         href={href}
         aria-label={ariaLabel}
         className={cls}
@@ -178,7 +205,7 @@ export function Button({
   }
   return (
     <button
-      ref={ref as React.Ref<HTMLButtonElement>}
+      ref={setRef}
       type={type}
       onClick={handleClick}
       disabled={disabled}

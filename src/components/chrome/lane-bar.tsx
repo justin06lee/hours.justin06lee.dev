@@ -79,12 +79,23 @@ export function LaneBar({
   // One interval for the whole bar, alive only while something is running.
   useEffect(() => {
     if (!ticking) return;
+    // Date.now() cannot seed the state during render: the server would stamp
+    // its own clock into the HTML and hydration would disagree with it, so the
+    // first real reading has to land after mount.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setNow(Date.now());
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, [ticking]);
 
   if (!visible) return null;
+
+  // A row is only a control when it actually does something. Rendering the
+  // default (no `onLaneClick`) case as a disabled button would drop every
+  // lane's text out of the tab order, out of selection, and have it announced
+  // as an unavailable control.
+  const interactive = Boolean(onLaneClick);
+  const Tag = interactive ? "button" : "div";
 
   return (
     <div
@@ -118,13 +129,16 @@ export function LaneBar({
                 key={lane.id}
                 className="flex items-center justify-between gap-2 px-3 py-2"
               >
-                <button
-                  type="button"
-                  onClick={onLaneClick ? () => onLaneClick(lane.id) : undefined}
-                  disabled={!onLaneClick}
+                <Tag
+                  {...(interactive
+                    ? {
+                        type: "button" as const,
+                        onClick: () => onLaneClick!(lane.id),
+                      }
+                    : {})}
                   className={cn(
                     "flex min-w-0 flex-1 flex-col items-start text-left",
-                    onLaneClick ? "cursor-pointer" : "cursor-default",
+                    interactive ? "cursor-pointer" : "cursor-default",
                   )}
                 >
                   <span className="flex min-w-0 max-w-full items-center gap-2 text-sm text-white">
@@ -147,7 +161,7 @@ export function LaneBar({
                       <span className="truncate text-xs text-white/30">paused</span>
                     )
                   )}
-                </button>
+                </Tag>
                 {lane.actions && (
                   <div className="flex shrink-0 items-center gap-2">{lane.actions}</div>
                 )}

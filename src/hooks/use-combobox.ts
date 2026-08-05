@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  useCallback,
   useEffect,
   useId,
   useMemo,
@@ -54,20 +55,39 @@ export function useCombobox<T extends string | number>({
   value,
   options,
 }: UseComboboxOptions<T>): UseComboboxReturn<T> {
-  const [open, setOpen] = useState(false);
+  const [open, setOpenState] = useState(false);
   const [query, setQuery] = useState("");
-  const [activeIndex, setActiveIndex] = useState(-1);
+  // The highlight is stored together with the row set it was picked from, and
+  // read back only while that set still holds. Resetting it on `filtered`'s
+  // identity was wrong: callers pass an inline `options` array (the normal
+  // shape), so `filtered` is a fresh array on every parent render and any
+  // unrelated parent update wiped the highlight — and aria-activedescendant —
+  // mid-navigation. Keying on content survives that. Deliberately not clamped
+  // to `filtered.length`: consumers prepend create/clear rows, so a low index
+  // can still be a real row when nothing matches the query.
+  const [active, setActive] = useState({ query, count: options.length, index: -1 });
+  const activeIndex =
+    active.query === query && active.count === options.length ? active.index : -1;
+  const setActiveIndex = (i: number) =>
+    setActive({ query, count: options.length, index: i });
   const containerRef = useRef<HTMLDivElement>(null);
   const baseId = useId();
   const listboxId = `${baseId}-listbox`;
   const rowId = (i: number) => `${baseId}-row-${i}`;
 
-  useEffect(() => {
-    if (!open) {
+  // Clearing the search on close belongs on the transition itself, not in an
+  // effect watching `open` — an effect costs a second render pass and the
+  // stale query is briefly live in between.
+  const setOpen = useCallback((next: boolean) => {
+    setOpenState(next);
+    if (!next) {
       setQuery("");
-      setActiveIndex(-1);
-      return;
+      setActive((a) => ({ ...a, index: -1 }));
     }
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
     const onPointer = (e: MouseEvent) => {
       if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
         setOpen(false);
@@ -77,19 +97,13 @@ export function useCombobox<T extends string | number>({
     return () => {
       document.removeEventListener("mousedown", onPointer);
     };
-  }, [open]);
+  }, [open, setOpen]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return options;
     return options.filter((o) => o.label.toLowerCase().includes(q));
   }, [options, query]);
-
-  // Reset the highlight whenever the navigable rows change (filtering or an
-  // options update) so it never points at a stale row.
-  useEffect(() => {
-    setActiveIndex(-1);
-  }, [filtered]);
 
   const selected = useMemo(
     () => options.find((o) => o.value === value) ?? null,
