@@ -15,7 +15,7 @@ import { useBreakAlarm } from "@/hooks/use-break-alarm";
 import type { CalendarActual } from "@/lib/calendar";
 import type { CalendarCategory } from "@/lib/calendar-categories";
 import { MAX_TRACK, PRIMARY_TRACK } from "@/lib/calendar-constants";
-import { segmentLane, startLane, stopAllLanes, stopLane } from "@/app/actions";
+import { segmentLanes, startLane, startLanes, stopAllLanes, stopLane } from "@/app/actions";
 import { cn } from "@/lib/utils";
 
 type Draft = { categoryId: string; title: string };
@@ -164,20 +164,27 @@ function Console({
 
   const alarm = useBreakAlarm(anyRunning, handleAlarm);
 
-  /** Close every prompted lane with its description, then start the break. */
+  /**
+   * Close every prompted lane with its description, then start the break.
+   *
+   * One Server Action for all of them, not one per lane: this used to be a
+   * `for` loop of awaited `segmentLane` calls, i.e. N separate POSTs each
+   * paying a fresh admin check, site config read and revalidate. The batch
+   * action is also atomic, so `lanes` is either the post-close truth or
+   * untouched — there is no half-logged state to reconcile.
+   */
   const submitSegments = () => {
     const segments = prompting ?? [];
     startTransition(async () => {
-      for (const seg of segments) {
-        const notes = descriptions[seg.id]?.trim() || null;
-        // resume:false — the break happens between chunks, not during one.
-        const result = await segmentLane({ ...seg, notes, resume: false });
-        if (!result.ok) {
-          toast({ title: result.error, variant: "danger" });
-          return;
-        }
-        setLanes(result.lanes);
-      }
+      const result = await segmentLanes(
+        segments.map((seg) => ({
+          ...seg,
+          notes: descriptions[seg.id]?.trim() || null,
+          // resume:false — the break happens between chunks, not during one.
+          resume: false,
+        })),
+      );
+      if (!apply(result)) return;
       setPrompting(null);
       setDescriptions({});
       setResumeAfterBreak(segments);
@@ -203,14 +210,17 @@ function Console({
       return;
     }
     startTransition(async () => {
-      for (const seg of toResume) {
-        const result = await startLane({
+      // One POST for every lane, same as submitSegments. The old loop also
+      // swallowed per-lane failures silently; `apply` surfaces them, which
+      // matters more now that a failure means nothing resumed at all.
+      const result = await startLanes(
+        toResume.map((seg) => ({
           track: seg.track,
           categoryId: seg.categoryId,
           title: seg.title,
-        });
-        if (result.ok) setLanes(result.lanes);
-      }
+        })),
+      );
+      if (!apply(result)) return;
       toast({ title: "back at it", variant: "success" });
     });
   };
