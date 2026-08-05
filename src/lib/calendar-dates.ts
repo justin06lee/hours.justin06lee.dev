@@ -188,6 +188,19 @@ export function epochToLocalInput(ms: number, timezone: string): string {
  * correct by the offset between that UTC instant's tz wall-clock and the
  * intended one. Two passes handle DST cleanly (the offset depends on the
  * day, so we re-anchor after the first correction).
+ *
+ * **Returns `NaN`** — not `null`, not a throw — when `s` is not exactly
+ * `YYYY-MM-DDTHH:MM`. The return type stays `number` on purpose: callers pass
+ * the result straight into arithmetic and comparisons, and widening it to
+ * `number | null` would be a breaking change across the calendar layer. Any
+ * caller handling user-supplied input must therefore test the result with
+ * `Number.isNaN` (or `Number.isFinite`) before storing or comparing it — NaN
+ * compares false against everything and will silently drop rows otherwise.
+ *
+ * Ambiguous times (the hour repeated by a fall-back transition) resolve to the
+ * first, pre-transition instant. Non-existent times (the hour skipped by a
+ * spring-forward transition) snap forward by the gap: `02:30` inside a
+ * `02:00 → 03:00` jump means `03:30`, never `01:30`.
  */
 export function localInputToEpoch(s: string, timezone: string): number {
   const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(s);
@@ -201,7 +214,12 @@ export function localInputToEpoch(s: string, timezone: string): number {
 
   // Initial guess: treat the wall-clock fields as if they were UTC.
   let guess = Date.UTC(targetY, targetMo - 1, targetD, targetH, targetMi);
-  for (let i = 0; i < 2; i++) {
+  // Two correction passes as before; the third iteration only *measures* the
+  // leftover delta at the final guess, so the check below sees the residual at
+  // the value actually being returned rather than a stale one. It costs a third
+  // Intl lookup only when the first two haven't already converged.
+  let delta = 0;
+  for (let i = 0; i < 3; i++) {
     const parts = new Intl.DateTimeFormat("en-CA", {
       timeZone: timezone,
       year: "numeric",
@@ -216,10 +234,22 @@ export function localInputToEpoch(s: string, timezone: string): number {
     const gotHour = get("hour") === 24 ? 0 : get("hour");
     const gotUtc = Date.UTC(get("year"), get("month") - 1, get("day"), gotHour, get("minute"));
     const wantUtc = Date.UTC(targetY, targetMo - 1, targetD, targetH, targetMi);
-    const delta = wantUtc - gotUtc;
+    delta = wantUtc - gotUtc;
     if (delta === 0) break;
-    guess += delta;
+    if (i < 2) guess += delta;
   }
+  // A delta still outstanding after two passes means no instant carries the
+  // requested wall-clock time: it sits inside a spring-forward gap. The passes
+  // then oscillate between the two instants bracketing the gap, and can settle
+  // on the earlier one — so "02:30" on a US spring-forward day came back as
+  // 01:30 local, an hour BEFORE what was typed. A positive residual is exactly
+  // that case (the zone's clock at `guess` still lags the request by the gap),
+  // so add it once more to snap FORWARD, the conventional resolution: 02:30
+  // inside a 02:00 → 03:00 jump means 03:30. A negative residual already sits
+  // after the gap and is left alone. Non-gap inputs converge to delta 0 above,
+  // including ambiguous fall-back times, where both candidate instants match
+  // and the earlier (pre-transition) one is returned.
+  if (delta > 0) guess += delta;
   return guess;
 }
 
@@ -248,6 +278,23 @@ export function overlapIntensityClass(ratio: number, scale: "year" | "month"): s
  *
  * - `endAt = null` means "currently running"; we use `nowMs` (default Date.now()) as the right edge.
  * - Blocks that span across midnight are clamped to [0, 1440] for the visible day.
+ *
+ * **Known approximation: every day is treated as 1440 minutes long.** On the
+ * two DST transition days a year that is wrong by exactly the transition size
+ * (one hour in US/EU zones):
+ * - Fall back (25-hour day): a block covering the whole day reports 1440
+ *   minutes instead of 1500 — the last hour is not represented.
+ * - Spring forward (23-hour day): the same block reports 1440 instead of 1380,
+ *   overstating by an hour, and minute values in the skipped range map to
+ *   wall-clock times that never occurred.
+ * Worst case is therefore 60 minutes (4.2%) on 2 days of 365; every other day
+ * is exact. This is deliberate, not an oversight: the value feeds a fixed
+ * 0–1440 render axis (`components/chrome/timeline.tsx`) and is intersected
+ * against a literal `[[0, 1440]]` full-day window in `lib/calendar.ts`, so a
+ * 1500 returned here would overflow the axis and be clipped straight back to
+ * 1440 by the intersection — the error would move, not disappear. Deriving the
+ * true day length costs extra Intl work on a path that runs once per actual per
+ * visible day across a year heatmap. Fix this at the axis, not here.
  */
 export function clampActualToDay(
   date: string,

@@ -55,6 +55,19 @@ function readSettings(): AlarmSettings {
 function useChime() {
   const ctxRef = useRef<AudioContext | null>(null);
 
+  // An AudioContext is a device handle, not a plain object: Chrome caps a
+  // document at about six, and the constructor throws once that is reached.
+  // That throw lands in the catch below, so a leak per mount would not surface
+  // as an error — the alarm would simply go silent and stay silent.
+  useEffect(() => {
+    return () => {
+      const ctx = ctxRef.current;
+      ctxRef.current = null;
+      // close() rejects if the context is already closed; either way it's gone.
+      void ctx?.close().catch(() => {});
+    };
+  }, []);
+
   return useCallback(() => {
     try {
       type WithWebkit = typeof globalThis & { webkitAudioContext?: typeof AudioContext };
@@ -128,6 +141,14 @@ export function useBreakAlarm(active: boolean, onFire?: () => void): BreakAlarm 
     onFireRef.current = onFire;
   }, [onFire]);
 
+  // Whether work was already in progress on the very first render — captured
+  // here because a ref initialiser is the one place that value survives
+  // untouched into the mount effect below, which deliberately runs only once.
+  // It is server truth: `active` traces back to the running lanes the page was
+  // rendered with, so it says whether the stretch this deadline belongs to is
+  // still going.
+  const activeAtMountRef = useRef(active);
+
   // Hydrate from storage after mount so the server render stays stable.
   // localStorage cannot be read during SSR, so applying stored values on mount
   // is the entire point: the server and first client render must agree on the
@@ -138,7 +159,26 @@ export function useBreakAlarm(active: boolean, onFire?: () => void): BreakAlarm 
     setSettingsState(readSettings());
     const raw = window.localStorage.getItem(DEADLINE_KEY);
     const parsed = raw ? Number(raw) : NaN;
-    if (Number.isFinite(parsed)) setDeadline(parsed);
+    // A stored deadline only means something while the stretch that set it is
+    // still running, and whether work was already in progress at mount is
+    // exactly what tells the two cases apart:
+    //
+    //   active — a reload mid-stretch, or a machine asleep through the
+    //     deadline. Restore it even when it has already passed: the tick below
+    //     will fire immediately, which is the promise made above, and is why
+    //     the deadline is stored as an absolute time in the first place.
+    //   idle — nothing is running, so this is residue from a session that
+    //     ended without disarming (tab closed, or the lanes stopped from
+    //     another device). Past or future it belongs to a stretch that is
+    //     over, and keeping it is worse than losing it: the caller only arms
+    //     when the deadline is null, so a leftover value makes the next start
+    //     skip arming and drops the user into a break seconds in. Clear it and
+    //     the next start arms a whole interval from now.
+    if (Number.isFinite(parsed) && (parsed > Date.now() || activeAtMountRef.current)) {
+      setDeadline(parsed);
+    } else if (raw !== null) {
+      window.localStorage.removeItem(DEADLINE_KEY);
+    }
     setNotifyPermission(
       typeof Notification === "undefined" ? "unsupported" : Notification.permission,
     );

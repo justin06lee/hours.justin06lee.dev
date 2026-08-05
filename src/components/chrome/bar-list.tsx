@@ -95,7 +95,13 @@ export function BarList({
         );
 
         return (
-          <li key={item.id ?? index} className="border-b border-white/10 last:border-b-0">
+          // Index keys would make a re-sorted list animate each bar from its
+          // predecessor's width instead of re-keying, so fall back to `label`
+          // whenever it is a plain string — only a non-string node is unusable.
+          <li
+            key={item.id ?? (typeof item.label === "string" ? item.label : index)}
+            className="border-b border-white/10 last:border-b-0"
+          >
             {item.href ? (
               <LinkComponent href={item.href} className={rowClass}>
                 {inner}

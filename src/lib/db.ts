@@ -1,26 +1,36 @@
+import { createHash } from "node:crypto";
 import { createClient } from "@libsql/client";
 import { SLEEP_CATEGORY_ID } from "./calendar-constants";
 
 export { SLEEP_CATEGORY_ID };
 
-export const db = createClient({
-  url: process.env.TURSO_DATABASE_URL!,
-  authToken: process.env.TURSO_AUTH_TOKEN!,
-});
-
-// Memoize so initDb() costs ~0 after the first call in a worker process.
-// Without this, every lib function call (7+ per request) re-runs the full
-// schema batch — adding hundreds of ms to each page load.
-let initPromise: Promise<void> | null = null;
-
-export function initDb(): Promise<void> {
-  if (!initPromise) initPromise = doInit();
-  return initPromise;
+/** A missing connection variable used to reach the driver as `undefined` and
+ *  surface as whatever opaque parse error it produced — at module evaluation,
+ *  so the stack pointed at `createClient` rather than at the deployment that
+ *  forgot to set the variable. Name it instead. */
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`${name} is not set; the app cannot reach its database.`);
+  }
+  return value;
 }
 
-async function doInit(): Promise<void> {
-  await db.batch([
-    `CREATE TABLE IF NOT EXISTS items (
+export const db = createClient({
+  url: requireEnv("TURSO_DATABASE_URL"),
+  authToken: requireEnv("TURSO_AUTH_TOKEN"),
+});
+
+// ---------------------------------------------------------------------------
+// Migration data
+//
+// The migration is expressed as data rather than a sequence of awaits so that
+// (a) it can be batched into a handful of round trips and (b) it can be hashed
+// into a fingerprint — see SCHEMA_FINGERPRINT below.
+// ---------------------------------------------------------------------------
+
+const SCHEMA_DDL: string[] = [
+  `CREATE TABLE IF NOT EXISTS items (
       id TEXT PRIMARY KEY,
       category TEXT NOT NULL,
       title TEXT NOT NULL,
@@ -36,12 +46,12 @@ async function doInit(): Promise<void> {
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     )`,
-    `CREATE TABLE IF NOT EXISTS site_config (
+  `CREATE TABLE IF NOT EXISTS site_config (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
       updated_at TEXT DEFAULT (datetime('now'))
     )`,
-    `CREATE TABLE IF NOT EXISTS uploads (
+  `CREATE TABLE IF NOT EXISTS uploads (
       id TEXT PRIMARY KEY,
       filename TEXT NOT NULL,
       mime_type TEXT NOT NULL,
@@ -49,31 +59,31 @@ async function doInit(): Promise<void> {
       article_slug TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     )`,
-    `CREATE TABLE IF NOT EXISTS sessions (
+  `CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
       created_at INTEGER NOT NULL
     )`,
-    `CREATE TABLE IF NOT EXISTS login_attempts (
+  `CREATE TABLE IF NOT EXISTS login_attempts (
       ip TEXT PRIMARY KEY,
       count INTEGER NOT NULL,
       first_attempt INTEGER NOT NULL
     )`,
-    `CREATE TABLE IF NOT EXISTS api_mutation_rate (
+  `CREATE TABLE IF NOT EXISTS api_mutation_rate (
       ip TEXT PRIMARY KEY,
       count INTEGER NOT NULL,
       first_attempt INTEGER NOT NULL
     )`,
-    `CREATE TABLE IF NOT EXISTS pat_counter (
+  `CREATE TABLE IF NOT EXISTS pat_counter (
       id INTEGER PRIMARY KEY,
       count INTEGER NOT NULL DEFAULT 0
     )`,
-    `INSERT OR IGNORE INTO pat_counter (id, count) VALUES (1, 0)`,
-    `CREATE TABLE IF NOT EXISTS pat_rate (
+  `INSERT OR IGNORE INTO pat_counter (id, count) VALUES (1, 0)`,
+  `CREATE TABLE IF NOT EXISTS pat_rate (
       ip TEXT PRIMARY KEY,
       window_start INTEGER NOT NULL,
       pats INTEGER NOT NULL
     )`,
-    `CREATE TABLE IF NOT EXISTS calendar_tasks (
+  `CREATE TABLE IF NOT EXISTS calendar_tasks (
       id TEXT PRIMARY KEY,
       date TEXT NOT NULL,
       title TEXT NOT NULL,
@@ -88,8 +98,8 @@ async function doInit(): Promise<void> {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     )`,
-    `CREATE INDEX IF NOT EXISTS idx_calendar_tasks_date ON calendar_tasks(date)`,
-    `CREATE TABLE IF NOT EXISTS calendar_categories (
+  `CREATE INDEX IF NOT EXISTS idx_calendar_tasks_date ON calendar_tasks(date)`,
+  `CREATE TABLE IF NOT EXISTS calendar_categories (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       color TEXT NOT NULL,
@@ -99,11 +109,11 @@ async function doInit(): Promise<void> {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     )`,
-    `CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_categories_name_lower ON calendar_categories(LOWER(name))`,
-    // FK clauses below are declarative; libsql does not enable
-    // PRAGMA foreign_keys per-connection, so SET NULL is enforced
-    // at the app level (see calendar-categories.ts deleteCategory).
-    `CREATE TABLE IF NOT EXISTS calendar_actuals (
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_categories_name_lower ON calendar_categories(LOWER(name))`,
+  // FK clauses below are declarative; libsql does not enable
+  // PRAGMA foreign_keys per-connection, so SET NULL is enforced
+  // at the app level (see calendar-categories.ts deleteCategory).
+  `CREATE TABLE IF NOT EXISTS calendar_actuals (
       id TEXT PRIMARY KEY,
       date TEXT NOT NULL,
       plan_id TEXT,
@@ -118,12 +128,16 @@ async function doInit(): Promise<void> {
       FOREIGN KEY (plan_id) REFERENCES calendar_tasks(id) ON DELETE SET NULL,
       FOREIGN KEY (category_id) REFERENCES calendar_categories(id) ON DELETE SET NULL
     )`,
-    `CREATE INDEX IF NOT EXISTS idx_calendar_actuals_date ON calendar_actuals(date)`,
-    // NOTE: the partial UNIQUE index guarding the running-row invariant is
-    // created below, after ensureColumn guarantees `track` exists. It cannot
-    // live in this batch because older installations reach here without the
-    // column the index is built on.
-    `CREATE TABLE IF NOT EXISTS prayer_times_cache (
+  `CREATE INDEX IF NOT EXISTS idx_calendar_actuals_date ON calendar_actuals(date)`,
+  // categoryUsage() scans by category_id before every category delete, and the
+  // entry list orders the whole table by start_at on every homepage render.
+  // Both were full table scans.
+  `CREATE INDEX IF NOT EXISTS idx_calendar_actuals_category ON calendar_actuals(category_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_calendar_actuals_start_at ON calendar_actuals(start_at)`,
+  // NOTE: the partial UNIQUE index guarding the running-row invariant lives in
+  // POST_STEPS, not here, because it is built on `track` — a column older
+  // installations only acquire via COLUMN_SPECS a step later.
+  `CREATE TABLE IF NOT EXISTS prayer_times_cache (
       cache_key TEXT PRIMARY KEY,
       year INTEGER NOT NULL,
       month INTEGER NOT NULL,
@@ -133,71 +147,250 @@ async function doInit(): Promise<void> {
       data TEXT NOT NULL,
       fetched_at INTEGER NOT NULL
     )`,
-  ]);
+];
 
-  // Idempotent migration for installations that predate `category_id`. The
-  // CREATE TABLE above already includes the column for fresh schemas; this
-  // adds it to older deployments without dropping data.
-  await ensureColumn("calendar_tasks", "category_id", "TEXT");
-  await ensureColumn("calendar_tasks", "is_uncertain", "INTEGER NOT NULL DEFAULT 0");
-  await ensureColumn("calendar_tasks", "fallbacks", "TEXT");
-  await ensureColumn("items", "pinned", "INTEGER NOT NULL DEFAULT 0");
+type ColumnSpec = { table: string; column: string; type: string };
 
+// Idempotent column migrations for installations that predate these columns.
+// The CREATE TABLE statements above already include them for fresh schemas;
+// these add them to older deployments without dropping data.
+const COLUMN_SPECS: ColumnSpec[] = [
+  { table: "calendar_tasks", column: "category_id", type: "TEXT" },
+  { table: "calendar_tasks", column: "is_uncertain", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "calendar_tasks", column: "fallbacks", type: "TEXT" },
+  { table: "items", column: "pinned", type: "INTEGER NOT NULL DEFAULT 0" },
   // Parallel tracks. `track` lanes concurrent activity — working out while a
   // build runs, studying while socialising — so two things happening at once
   // are two rows, not a lie about one of them. Pre-existing rows default to
   // lane 0, which is exactly where the old single-timer behaviour lived, so
   // this is a pure widening: nothing that worked before changes meaning.
-  await ensureColumn("calendar_actuals", "track", "INTEGER NOT NULL DEFAULT 0");
+  { table: "calendar_actuals", column: "track", type: "INTEGER NOT NULL DEFAULT 0" },
+];
 
-  // The running-row invariant is now per-lane: at most one open row PER track
-  // rather than one globally. The old global index has to be dropped first —
-  // it forbids exactly the second concurrent lane the new one exists to
-  // allow. Both statements are idempotent, and both must run after the
-  // ensureColumn above so the indexed column is guaranteed to exist.
-  await db.execute({
-    sql: `DROP INDEX IF EXISTS idx_calendar_actuals_running`,
-    args: [],
-  });
-  await db.execute({
-    sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_actuals_running_track
+// Runs on EVERY cold start, including the fingerprint fast path — it rides
+// along in the probe batch below, so it costs no extra round trip.
+//
+// It has to be unconditional because this database is shared with
+// justin06lee.dev. The old global index forbids exactly the second concurrent
+// lane that this app's per-lane index exists to allow, so if the sibling app
+// ever re-creates it, a fingerprint-gated drop would never run again and
+// starting lane 1 while lane 0 runs would fail forever — reported to the user
+// as "that lane was just started somewhere else", with no recovery short of a
+// code edit. Dropping every time is a cheap no-op and closes that hole.
+//
+// Safe on a fresh database too: `DROP INDEX IF EXISTS` resolves the index by
+// name and no-ops when it is absent, whether or not the table exists yet.
+const DROP_LEGACY_RUNNING_INDEX = `DROP INDEX IF EXISTS idx_calendar_actuals_running`;
+
+const POST_STEPS: string[] = [
+  // Make the index below creatable. `CREATE UNIQUE INDEX` does not skip
+  // offending rows — it fails outright if the table already holds two open rows
+  // on one track, which a crashed migration or the sibling app can leave
+  // behind. That failure rejects initDb(), so EVERY page 500s on EVERY cold
+  // start with no recovery short of a code edit. Closing the duplicates first
+  // turns an unrecoverable state into a repaired one.
+  //
+  // The EXISTS names one strictly-newer open row on the SAME track under the
+  // total order (start_at, id), so per track exactly the maximum survives and
+  // every other open row on that track is closed. Consequences worth being
+  // explicit about, because this runs against a shared production database:
+  //   - a track whose only open row is that row matches nothing (the
+  //     comparison is strict and cannot find the row itself), so a legitimately
+  //     running lane is never touched;
+  //   - `=` rather than `IS` mirrors the index exactly, which treats NULLs as
+  //     distinct, so it closes precisely the rows the index would reject;
+  //   - re-running finds one open row per track and updates nothing, which is
+  //     also why the normal case — at most one open row per track — is a no-op;
+  //   - it only ever sets `end_at`; no row is deleted and no other column moves.
+  // MAX() rather than a bare `updated_at` because a row whose updated_at
+  // predates its start_at would otherwise be closed before it began, and a
+  // negative duration would corrupt every total that reads it.
+  `UPDATE calendar_actuals
+          SET end_at = MAX(start_at, updated_at)
+          WHERE end_at IS NULL
+            AND EXISTS (
+              SELECT 1 FROM calendar_actuals o
+               WHERE o.end_at IS NULL
+                 AND o.track = calendar_actuals.track
+                 AND (o.start_at > calendar_actuals.start_at
+                      OR (o.start_at = calendar_actuals.start_at
+                          AND o.id > calendar_actuals.id))
+            )`,
+  // The running-row invariant is per-lane: at most one open row PER track
+  // rather than one globally. This must run after the `calendar_actuals.track`
+  // migration so the indexed column is guaranteed to exist — hence a separate
+  // batch, issued after the ALTERs — and after DROP_LEGACY_RUNNING_INDEX,
+  // which the probe batch has already applied by this point. The repair above
+  // and this creation share a batch, so no writer can slip a second open row
+  // in between them.
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_actuals_running_track
           ON calendar_actuals(track) WHERE end_at IS NULL`,
-    args: [],
-  });
-
   // One-time cleanup of pre-2026-05 fallback rows. The old shape was
   // `[{"type":"category"|"title", ...}]`; the new shape has no `"type"` key.
   // The runtime parser already discards old rows silently, but clearing the
   // column here means re-edits don't show ghost-uncertain tasks with no alts.
   // Idempotent: subsequent runs find no `"type":` substrings and no-op.
-  await db.execute({
-    sql: `UPDATE calendar_tasks SET fallbacks = NULL WHERE fallbacks LIKE '%"type":%'`,
-    args: [],
-  });
+  `UPDATE calendar_tasks SET fallbacks = NULL WHERE fallbacks LIKE '%"type":%'`,
+];
 
-  // Seed the built-in Sleep category if not present.
-  await db.execute({
-    sql: `INSERT INTO calendar_categories (id, name, color, is_system, archived, position, created_at, updated_at)
+// Seed the built-in Sleep category if not present. Kept out of POST_STEPS
+// because it takes arguments; its timestamps are per-run, so only the SQL and
+// the stable arguments feed the fingerprint.
+const SLEEP_SEED_SQL = `INSERT INTO calendar_categories (id, name, color, is_system, archived, position, created_at, updated_at)
           SELECT ?, 'Sleep', ?, 1, 0, 0, ?, ?
-          WHERE NOT EXISTS (SELECT 1 FROM calendar_categories WHERE LOWER(name) = 'sleep')`,
-    args: [SLEEP_CATEGORY_ID, "#5b5b8a", Date.now(), Date.now()],
-  });
+          WHERE NOT EXISTS (SELECT 1 FROM calendar_categories WHERE LOWER(name) = 'sleep')`;
+const SLEEP_COLOR = "#5b5b8a";
+
+// Derived from the migration content itself — the DDL, the column specs, the
+// post-steps, and the seed. That is the whole point: ANY future edit to that
+// data changes this hash, which makes the next cold start re-run the full
+// migration. Nobody has to remember to bump a version number, and nobody can
+// ship a schema edit that silently never runs.
+const SCHEMA_FINGERPRINT = createHash("sha256")
+  .update(
+    JSON.stringify([
+      SCHEMA_DDL,
+      COLUMN_SPECS,
+      DROP_LEGACY_RUNNING_INDEX,
+      POST_STEPS,
+      SLEEP_SEED_SQL,
+      SLEEP_CATEGORY_ID,
+      SLEEP_COLOR,
+    ]),
+  )
+  .digest("hex")
+  .slice(0, 16);
+
+// Memoize so initDb() costs ~0 after the first call in a worker process.
+// Without this, every lib function call (7+ per request) re-runs the full
+// schema batch — adding hundreds of ms to each page load.
+let initPromise: Promise<void> | null = null;
+
+export function initDb(): Promise<void> {
+  if (!initPromise) {
+    // Clear the memo on failure. A rejected promise cached here would poison
+    // the worker forever: one transient network blip on a cold start and every
+    // later request in that process fails permanently. The rejection is still
+    // re-thrown so the caller that triggered it sees the error; only the next
+    // caller gets a fresh attempt. (The reset runs in a microtask, after this
+    // assignment, so it can never null out the promise being installed.)
+    initPromise = doInit().catch((err) => {
+      initPromise = null;
+      throw err;
+    });
+  }
+  return initPromise;
 }
 
-// SQLite cannot parameterize identifiers, so caller-provided table/column/type
-// strings are interpolated directly. Allowlist them to prevent injection if
-// callers ever pass non-literal values.
+async function doInit(): Promise<void> {
+  // Fast path: one round trip to learn whether the schema is already current.
+  // Creating the bookkeeping table and reading the fingerprint travel together
+  // as a single batch, so a warm schema costs exactly one hop instead of the
+  // ten the full migration below needs.
+  //
+  // The 'fingerprint' key is scoped to this app's migration set. The database
+  // is shared with justin06lee.dev, which runs its own schema code; if that
+  // site ever adopts this pattern it must use a different key.
+  const probe = await db.batch(
+    [
+      `CREATE TABLE IF NOT EXISTS schema_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+      DROP_LEGACY_RUNNING_INDEX,
+      `SELECT value FROM schema_state WHERE key = 'fingerprint'`,
+    ],
+    "write",
+  );
+  if (probe[2].rows[0]?.value === SCHEMA_FINGERPRINT) return;
+
+  // Slow path. Two cold workers can reach here at once and both migrate; that
+  // is safe because every statement below is idempotent (CREATE/DROP ... IF
+  // [NOT] EXISTS, ALTER only for genuinely missing columns, guarded INSERTs),
+  // so the loser of the race simply redoes work that changes nothing.
+  await db.batch(SCHEMA_DDL, "write");
+
+  // One batch for all the column checks: three distinct PRAGMA reads cover
+  // five column specs, so dedupe by table rather than paying a hop per column
+  // the way the old ensureColumn() did.
+  //
+  // Deliberately "deferred" (the driver's default) rather than "read". These
+  // are pure metadata reads, but "read" opens a READONLY transaction and it is
+  // not worth betting a cold start on how sqld classifies a PRAGMA inside one:
+  // this runs on the migration path, so a wrong guess here fails the very
+  // first request after a deploy. A read-only transaction would buy nothing —
+  // there is no snapshot consistency to protect across a single metadata probe.
+  for (const spec of COLUMN_SPECS) assertSafeColumnSpec(spec);
+  const tables = [...new Set(COLUMN_SPECS.map((s) => s.table))];
+  const infos = await db.batch(
+    tables.map((t) => `PRAGMA table_info(${t})`),
+    "deferred",
+  );
+  const existing = new Map<string, Set<string>>(
+    tables.map((t, i) => [
+      t,
+      new Set((infos[i].rows as unknown as { name: string }[]).map((r) => r.name)),
+    ]),
+  );
+
+  // Issued one at a time rather than as a batch, and this is the one place we
+  // deliberately spend round trips instead of saving them.
+  //
+  // `ALTER TABLE ... ADD COLUMN` is the only non-idempotent statement in this
+  // migration: there is no `IF NOT EXISTS` form, and the PRAGMA read above is
+  // a separate round trip, so two cold workers can both observe a column
+  // missing and both try to add it. In a batch the loser's `duplicate column
+  // name` aborts and rolls back the whole transaction, doInit rejects, the
+  // request 500s, and — because the fingerprint is never written — it repeats
+  // on the next cold start too. Individually, the loser swallows the error for
+  // the column that already exists and the rest still apply.
+  //
+  // The cost is bounded and paid at most once per database: this loop is empty
+  // whenever the columns are already present, which is every run after the
+  // first.
+  const alters = COLUMN_SPECS.filter((s) => !existing.get(s.table)!.has(s.column));
+  for (const s of alters) {
+    try {
+      await db.execute({
+        sql: `ALTER TABLE ${s.table} ADD COLUMN ${s.column} ${s.type}`,
+        args: [],
+      });
+    } catch (e) {
+      // Lost the race to a concurrent worker — the column is there, which is
+      // all we wanted. Anything else is a real failure and must propagate.
+      if (!/duplicate column name/i.test((e as { message?: string })?.message ?? "")) throw e;
+    }
+  }
+
+  // Everything that has to happen after the columns exist, in one hop. Order
+  // is preserved within a batch, so the index rebuild still lands before the
+  // data repairs, and the fingerprint is written last — only a batch that
+  // fully succeeded records itself as done.
+  await db.batch(
+    [
+      ...POST_STEPS,
+      { sql: SLEEP_SEED_SQL, args: [SLEEP_CATEGORY_ID, SLEEP_COLOR, Date.now(), Date.now()] },
+      {
+        sql: `INSERT OR REPLACE INTO schema_state (key, value) VALUES ('fingerprint', ?)`,
+        args: [SCHEMA_FINGERPRINT],
+      },
+    ],
+    "write",
+  );
+
+  // Consequence of the fingerprint gate worth naming: the one-time `fallbacks`
+  // cleanup and the Sleep seed now only re-run when the fingerprint changes,
+  // not on every cold start. Both are one-time repairs, so that is correct —
+  // and the Sleep row cannot disappear behind our backs, because deleteCategory
+  // refuses to delete `is_system` rows.
+}
+
+// SQLite cannot parameterize identifiers, so table/column/type strings are
+// interpolated directly into the PRAGMA and ALTER statements above. Allowlist
+// them so a non-literal spec could never smuggle SQL in.
 const SAFE_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SAFE_TYPE = /^[A-Za-z0-9_ ()]+$/;
 
-async function ensureColumn(table: string, column: string, type: string): Promise<void> {
+function assertSafeColumnSpec({ table, column, type }: ColumnSpec): void {
   if (!SAFE_IDENT.test(table) || !SAFE_IDENT.test(column) || !SAFE_TYPE.test(type)) {
     throw new Error(`ensureColumn: unsafe identifier(s): ${table}.${column} ${type}`);
-  }
-  const info = await db.execute({ sql: `PRAGMA table_info(${table})`, args: [] });
-  const exists = (info.rows as unknown as { name: string }[]).some((r) => r.name === column);
-  if (!exists) {
-    await db.execute({ sql: `ALTER TABLE ${table} ADD COLUMN ${column} ${type}`, args: [] });
   }
 }
 

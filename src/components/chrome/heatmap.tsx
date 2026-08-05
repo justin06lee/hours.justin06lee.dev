@@ -1,5 +1,3 @@
-"use client";
-
 import { cn } from "@/lib/utils";
 
 const WEEKDAY_LETTERS = ["S", "M", "T", "W", "T", "F", "S"] as const;
@@ -17,6 +15,23 @@ function buildMonthGrid(year: number, month: number): (string | null)[] {
   for (let d = 1; d <= lastDay; d++) cells.push(`${year}-${mm}-${String(d).padStart(2, "0")}`);
   while (cells.length % 7 !== 0) cells.push(null);
   return cells;
+}
+
+/**
+ * The twelve grids depend on nothing but `year`, yet rebuilding them per render
+ * costs ~450 strings and 24 Date objects. Cached at module scope rather than in
+ * a hook so the component stays renderable on the server, where hooks like
+ * useMemo would be unavailable.
+ */
+const YEAR_GRIDS = new Map<number, (string | null)[][]>();
+
+function monthGrids(year: number): (string | null)[][] {
+  let grids = YEAR_GRIDS.get(year);
+  if (!grids) {
+    grids = Array.from({ length: 12 }, (_, idx) => buildMonthGrid(year, idx + 1));
+    YEAR_GRIDS.set(year, grids);
+  }
+  return grids;
 }
 
 /** Map a value to a 0..levels-1 bucket, then to a white alpha. Level 0 is faint. */
@@ -77,6 +92,7 @@ export function Heatmap({
 }: HeatmapProps) {
   const ceiling = max ?? Object.values(values).reduce((m, v) => (v > m ? v : m), 1);
   const interactive = Boolean(onSelectDay);
+  const grids = monthGrids(year);
 
   const cell = (date: string | null, i: number) => {
     if (!date) return <div key={i} className="aspect-square" />;
@@ -124,7 +140,7 @@ export function Heatmap({
                 ))}
               </div>
               <div className="grid grid-cols-7 gap-[3px]">
-                {buildMonthGrid(year, idx + 1).map(cell)}
+                {grids[idx].map(cell)}
               </div>
             </div>
           );

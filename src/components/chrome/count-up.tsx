@@ -77,6 +77,10 @@ export function CountUp({
 
     if (duration <= 0 || prefersReducedMotion()) {
       displayRef.current = to;
+      // The tween always starts from 0 so the server and the first client
+      // render agree; skipping to the target depends on matchMedia, which only
+      // exists on the client, so the jump can only happen after mount.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setDisplay(to);
       return;
     }

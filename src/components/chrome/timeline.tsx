@@ -4,6 +4,14 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 export type TimelineEvent = {
+  /**
+   * Stable identity across renders. Optional, but supply it whenever
+   * `onEventChange` is in play: committing a move usually re-sorts the day by
+   * `startMin`, and without an id a block is only identified by its position
+   * in the array, so the re-sort hands its DOM node (and any in-flight drag) to
+   * whichever event landed on that index.
+   */
+  id?: string;
   /** Minutes since midnight, 0–1440. */
   startMin: number;
   endMin: number;
@@ -114,10 +122,11 @@ export function TimelineMarker({
 }
 
 function NowLine({ minutes }: { minutes: number }) {
+  const clamped = Math.min(1440, Math.max(0, minutes));
   return (
     <div
       className="pointer-events-none absolute left-0 right-0 z-10 flex items-center"
-      style={{ top: `${(minutes / 1440) * 100}%` }}
+      style={{ top: `${(clamped / 1440) * 100}%` }}
     >
       <div className="-ml-1 size-2 shrink-0 rounded-full bg-red-500" />
       <div className="h-px flex-1 bg-red-500" />
@@ -130,9 +139,19 @@ function fmtHHMM(min: number) {
   return `${String(Math.floor(m / 60) % 24).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 }
 
+/** Identity of a block within its track: the caller's `id` when there is one. */
+function eventKey(e: TimelineEvent) {
+  return e.id ?? `${e.startMin}-${e.endMin}-${e.label}`;
+}
+
 type DragState = {
   trackIndex: number;
-  eventIndex: number;
+  /**
+   * Which event is being dragged, by `eventKey` rather than array index —
+   * a commit that re-sorts the day would otherwise leave this pointing at
+   * whatever event slid into that index.
+   */
+  eventKey: string;
   mode: "move" | "resize";
   pointerId: number;
   originY: number;
@@ -188,12 +207,33 @@ export function Timeline({
   const resolvedTracks: TimelineTrack[] = tracks ?? [{ events: events ?? [] }];
   const snap = Math.max(1, snapMinutes);
 
+  // The one place times are clamped: pointer drags and keyboard nudges both
+  // route through it so a nudge can never land somewhere a drag couldn't.
+  // "move" slides the block whole (duration preserved, kept inside the day);
+  // "resize" walks the end edge and never collapses the block past one snap.
+  const applyDelta = (
+    mode: DragState["mode"],
+    startMin: number,
+    endMin: number,
+    delta: number,
+  ): { startMin: number; endMin: number } => {
+    if (mode === "move") {
+      const dur = endMin - startMin;
+      const start = Math.min(1440 - dur, Math.max(0, startMin + delta));
+      return { startMin: start, endMin: start + dur };
+    }
+    return {
+      startMin,
+      endMin: Math.min(1440, Math.max(startMin + snap, endMin + delta)),
+    };
+  };
+
   const beginDrag = (
     el: HTMLElement,
     pe: React.PointerEvent,
     mode: DragState["mode"],
     trackIndex: number,
-    eventIndex: number,
+    key: string,
     startMin: number,
     endMin: number,
   ) => {
@@ -205,7 +245,7 @@ export function Timeline({
     el.setPointerCapture(pe.pointerId);
     setDrag({
       trackIndex,
-      eventIndex,
+      eventKey: key,
       mode,
       pointerId: pe.pointerId,
       originY: pe.clientY,
@@ -224,14 +264,30 @@ export function Timeline({
     const delta = Math.round(rawDelta / snap) * snap;
     setDrag((d) => {
       if (!d) return d;
-      if (d.mode === "move") {
-        const dur = d.endMin - d.startMin;
-        const curStart = Math.min(1440 - dur, Math.max(0, d.startMin + delta));
-        return { ...d, curStart, curEnd: curStart + dur, moved: d.moved || delta !== 0 };
-      }
-      const curEnd = Math.min(1440, Math.max(d.startMin + snap, d.endMin + delta));
-      return { ...d, curEnd, moved: d.moved || delta !== 0 };
+      const next = applyDelta(d.mode, d.startMin, d.endMin, delta);
+      return {
+        ...d,
+        curStart: next.startMin,
+        curEnd: next.endMin,
+        moved: d.moved || delta !== 0,
+      };
     });
+  };
+
+  // Keyboard equivalent of a drag, for anyone who can't hold a pointer down:
+  // Arrow moves the block by one snap step, Shift+Arrow drags its end edge.
+  // Each press commits on its own — there is no pointer-up to wait for.
+  const nudge = (
+    ke: React.KeyboardEvent,
+    event: TimelineEvent,
+    startMin: number,
+    endMin: number,
+  ) => {
+    if (!onEventChange) return;
+    const dir = ke.key === "ArrowUp" ? -1 : ke.key === "ArrowDown" ? 1 : 0;
+    if (dir === 0) return;
+    ke.preventDefault();
+    onEventChange(event, applyDelta(ke.shiftKey ? "resize" : "move", startMin, endMin, dir * snap));
   };
 
   const endDrag = (event: TimelineEvent) => {
@@ -276,14 +332,15 @@ export function Timeline({
                   {t.label}
                 </div>
               )}
-              {t.events.map((e, i) => {
+              {t.events.map((e) => {
                 // Clamp into the 0–1440 axis so out-of-range (negative or
                 // >24h) events stay within the visible day instead of
                 // overflowing the track.
                 let start = Math.min(1440, Math.max(0, e.startMin));
                 let end = Math.min(1440, Math.max(start, e.endMin));
+                const key = eventKey(e);
                 const dragging =
-                  drag != null && drag.trackIndex === ti && drag.eventIndex === i;
+                  drag != null && drag.trackIndex === ti && drag.eventKey === key;
                 if (dragging) {
                   start = drag.curStart;
                   end = drag.curEnd;
@@ -293,13 +350,21 @@ export function Timeline({
                 const color = e.color ?? "#ffffff";
                 const interactive = Boolean(handleClick);
                 const editable = Boolean(onEventChange);
-                const Tag = interactive ? "button" : "div";
+                // Editable blocks are buttons too, not just clickable ones:
+                // moving and resizing are keyboard-reachable (see `nudge`), and
+                // that needs a real focusable control with an accessible name.
+                const Tag = interactive || editable ? "button" : "div";
                 return (
                   <Tag
-                    key={i}
-                    {...(interactive
+                    key={key}
+                    {...(interactive || editable
                       ? {
                           type: "button" as const,
+                          "aria-label": `${fmtHHMM(start)}–${fmtHHMM(end)}${e.label ? ` ${e.label}` : ""}`,
+                        }
+                      : {})}
+                    {...(interactive
+                      ? {
                           onClick: () => {
                             if (suppressClick.current) {
                               suppressClick.current = false;
@@ -307,22 +372,27 @@ export function Timeline({
                             }
                             handleClick?.(e);
                           },
-                          "aria-label": `${fmtHHMM(start)}–${fmtHHMM(end)}${e.label ? ` ${e.label}` : ""}`,
                         }
                       : {})}
                     {...(editable
                       ? {
                           onPointerDown: (pe: React.PointerEvent<HTMLElement>) =>
-                            beginDrag(pe.currentTarget, pe, "move", ti, i, start, end),
+                            beginDrag(pe.currentTarget, pe, "move", ti, key, start, end),
                           onPointerMove: moveDrag,
                           onPointerUp: () => endDrag(e),
                           onPointerCancel: () => setDrag(null),
+                          onKeyDown: (ke: React.KeyboardEvent) => nudge(ke, e, start, end),
                         }
                       : {})}
                     className={cn(
                       "absolute left-0 right-1 overflow-hidden border-l-2 px-2 py-1 text-left",
                       interactive &&
-                        "cursor-pointer transition hover:ring-1 hover:ring-white/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/60 motion-reduce:transition-none",
+                        "cursor-pointer transition hover:ring-1 hover:ring-white/40 motion-reduce:transition-none",
+                      // Focus ring wherever the block is a control — an
+                      // editable-only block is reachable by keyboard now, so it
+                      // has to show where focus is.
+                      (interactive || editable) &&
+                        "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/60",
                       editable && "cursor-grab touch-none select-none",
                       dragging && "z-20 cursor-grabbing",
                     )}
@@ -344,7 +414,7 @@ export function Timeline({
                         className="absolute inset-x-0 bottom-0 h-1.5 cursor-ns-resize touch-none"
                         onPointerDown={(pe) => {
                           pe.stopPropagation();
-                          beginDrag(pe.currentTarget, pe, "resize", ti, i, start, end);
+                          beginDrag(pe.currentTarget, pe, "resize", ti, key, start, end);
                         }}
                         onPointerMove={(pe) => {
                           pe.stopPropagation();

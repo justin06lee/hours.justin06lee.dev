@@ -20,7 +20,7 @@
  *     bun run icons        # this script alone, from the committed SVG
  *     bun run icons:draw   # redraw the SVG first, then this
  */
-import { readFile, writeFile, rm, mkdir } from "node:fs/promises";
+import { readFile, writeFile, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import sharp from "sharp";

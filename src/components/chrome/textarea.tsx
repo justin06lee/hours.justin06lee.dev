@@ -19,7 +19,9 @@ export const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
         "disabled:opacity-50",
         className,
       )}
-      style={{ ...style, background }}
+      // Spread conditionally: writing `background: undefined` would tell React
+      // to clear the property, silently dropping a caller's `style.background`.
+      style={{ ...style, ...(background !== undefined && { background }) }}
       {...props}
     />
   ),
