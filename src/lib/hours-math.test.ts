@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   mergeIntervals,
   unionMs,
@@ -86,6 +86,21 @@ describe("unionMs vs rawMs — the site's central distinction", () => {
     expect(unionMs(serial)).toBe(rawMs(serial));
   });
 
+  it("skips non-finite spans in the raw sum rather than poisoning it", () => {
+    // mergeIntervals has always filtered these (see above), but rawMs guarded
+    // only `end`: `Math.max(0, NaN)` is NaN, so a single corrupt row turned
+    // every per-subject total on the page into NaN.
+    expect(rawMs([{ start: NaN, end: 5 }, { start: 0, end: H }])).toBe(H);
+    expect(rawMs([{ start: Infinity, end: 5 }, { start: 0, end: H }])).toBe(H);
+    expect(rawMs([{ start: NaN, end: NaN }])).toBe(0);
+  });
+
+  it("treats a non-finite end as zero duration, not as a dropped row", () => {
+    // A still-running entry reaches here with no end; it contributes nothing
+    // yet, which is different from the row being invalid.
+    expect(rawMs([{ start: 100, end: Infinity }])).toBe(0);
+  });
+
   it("never lets the union exceed elapsed wall-clock time", () => {
     // The invariant that makes the headline number trustworthy.
     const many = Array.from({ length: 8 }, () => ({ start: 0, end: H }));
@@ -133,6 +148,98 @@ describe("splitByDay", () => {
 
   it("returns nothing for an empty span", () => {
     expect(splitByDay({ start: noon, end: noon }, TZ)).toEqual([]);
+  });
+});
+
+describe("splitByDay — day boundaries land on true local midnight", () => {
+  const TZ = "America/Los_Angeles";
+  // The 2026 US transitions, both in LA:
+  //   spring forward  2026-03-08 02:00 PST -> 03:00 PDT  (a 23-hour day)
+  //   fall back       2026-11-01 02:00 PDT -> 01:00 PST  (a 25-hour day)
+  // The pre-existing tests above use 2026-03-10/03-11, which sit on the same
+  // side of the transition as each other — so DST was never actually exercised
+  // despite the code comment naming it as the reason for the design.
+  const MAR_08_MIDNIGHT = Date.parse("2026-03-08T08:00:00.000Z"); // PST, UTC-8
+  const MAR_09_MIDNIGHT = Date.parse("2026-03-09T07:00:00.000Z"); // PDT, UTC-7
+  const NOV_01_MIDNIGHT = Date.parse("2026-11-01T07:00:00.000Z"); // PDT, UTC-7
+  const NOV_02_MIDNIGHT = Date.parse("2026-11-02T08:00:00.000Z"); // PST, UTC-8
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("lands the boundary on the exact millisecond for a sub-minute start", () => {
+    // 23:00:37.123 local on 2026-06-30. Stepping in whole minutes put the cut
+    // at 00:00:37.123, handing 37 seconds of July to June.
+    const start = Date.parse("2026-07-01T06:00:37.123Z");
+    const segs = splitByDay({ start, end: start + 3 * H }, TZ);
+    expect(segs[0].date).toBe("2026-06-30");
+    expect(segs[0].end).toBe(Date.parse("2026-07-01T07:00:00.000Z"));
+    expect(segs[1].date).toBe("2026-07-01");
+    expect(segs[1].start).toBe(Date.parse("2026-07-01T07:00:00.000Z"));
+  });
+
+  it("gives the spring-forward day 23 hours, not 24", () => {
+    // Deliberately started off a whole minute, so the boundary assertions below
+    // catch minute-granularity stepping as well as a mishandled transition.
+    const segs = splitByDay(
+      { start: Date.parse("2026-03-07T20:00:17.500Z"), end: Date.parse("2026-03-10T20:00:17.500Z") },
+      TZ,
+    );
+    const mar08 = segs.find((s) => s.date === "2026-03-08")!;
+    expect(mar08.start).toBe(MAR_08_MIDNIGHT);
+    expect(mar08.end).toBe(MAR_09_MIDNIGHT);
+    expect(mar08.end - mar08.start).toBe(23 * H);
+  });
+
+  it("gives the fall-back day 25 hours, not 24", () => {
+    const segs = splitByDay(
+      { start: Date.parse("2026-10-31T20:00:29.750Z"), end: Date.parse("2026-11-03T20:00:29.750Z") },
+      TZ,
+    );
+    const nov01 = segs.find((s) => s.date === "2026-11-01")!;
+    expect(nov01.start).toBe(NOV_01_MIDNIGHT);
+    expect(nov01.end).toBe(NOV_02_MIDNIGHT);
+    expect(nov01.end - nov01.start).toBe(25 * H);
+  });
+
+  it("conserves duration and stays contiguous across a transition", () => {
+    // The invariant that matters most: however the boundaries move, the day
+    // segments must still tile the span exactly.
+    const start = Date.parse("2026-03-07T20:00:17.500Z");
+    const total = 72 * H;
+    const segs = splitByDay({ start, end: start + total }, TZ);
+    expect(segs.reduce((s, x) => s + (x.end - x.start), 0)).toBe(total);
+    expect(segs[0].start).toBe(start);
+    expect(segs[segs.length - 1].end).toBe(start + total);
+    for (let i = 1; i < segs.length; i++) expect(segs[i].start).toBe(segs[i - 1].end);
+  });
+
+  it("splits a span of 500 days without dropping the tail", () => {
+    // The old guard stopped at 400 segments and returned quietly, so a timer
+    // left running for over a year contributed 400 days to the heatmap while
+    // the headline total (which doesn't route through here) counted all of it.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const start = Date.parse("2025-01-01T12:00:00.000Z");
+    const total = 500 * 24 * H;
+    const segs = splitByDay({ start, end: start + total }, TZ);
+    expect(segs.length).toBeGreaterThan(400);
+    expect(segs.reduce((s, x) => s + (x.end - x.start), 0)).toBe(total);
+    expect(segs[segs.length - 1].end).toBe(start + total);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("warns rather than truncating silently when the guard does trip", () => {
+    // Slow by design — the only way to reach the bound is to actually produce
+    // that many segments. It buys the guarantee that a corrupt row announces
+    // itself instead of quietly deleting decades, and that it does not throw
+    // and take the page down with it.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const start = Date.parse("1990-01-01T12:00:00.000Z");
+    const segs = splitByDay({ start, end: Date.parse("2026-01-01T12:00:00.000Z") }, TZ);
+    expect(segs.length).toBe(10_000);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("truncated");
   });
 });
 
@@ -190,6 +297,36 @@ describe("computeStreak", () => {
     const active = new Set(["2026-06-30", "2026-07-01"]);
     expect(computeStreak(active, "2026-07-01").current).toBe(2);
   });
+
+  it("handles year boundaries", () => {
+    // A run must not reset just because the calendar year did.
+    const active = new Set(["2025-12-30", "2025-12-31", "2026-01-01"]);
+    const s = computeStreak(active, "2026-01-01");
+    expect(s.current).toBe(3);
+    expect(s.best).toBe(3);
+  });
+
+  it("carries the trailing window back across a year boundary", () => {
+    const active = new Set(["2025-12-31", "2026-01-01"]);
+    const { days } = computeStreak(active, "2026-01-02", 4);
+    // 2025-12-30, 2025-12-31, 2026-01-01, 2026-01-02
+    expect(days).toEqual([false, true, true, false]);
+  });
+
+  it("pads the window with false when it outruns the history", () => {
+    const active = new Set(["2026-07-28"]);
+    const s = computeStreak(active, TODAY, 30);
+    expect(s.days).toHaveLength(30);
+    expect(s.days[29]).toBe(true);
+    expect(s.days.slice(0, 29).every((d) => d === false)).toBe(true);
+    expect(s.current).toBe(1);
+    expect(s.best).toBe(1);
+  });
+
+  it("handles a leap day in the window", () => {
+    const active = new Set(["2028-02-28", "2028-02-29", "2028-03-01"]);
+    expect(computeStreak(active, "2028-03-01").current).toBe(3);
+  });
 });
 
 describe("formatting", () => {
@@ -200,6 +337,24 @@ describe("formatting", () => {
 
   it("drops to minutes below an hour", () => {
     expect(formatHours(42 * 60_000)).toBe("42m");
+    expect(formatHours(59.4 * 60_000)).toBe("59m");
+  });
+
+  it("switches to the hour format once minutes round up to 60", () => {
+    // The unit was chosen before the rounding, so 59.5–59.99 min failed the
+    // `>= 1h` test and then rounded to a label of "60m" — a reading the minutes
+    // format cannot legitimately produce.
+    expect(formatHours(59.5 * 60_000)).toBe("1.0h");
+    expect(formatHours(59.99 * 60_000)).toBe("1.0h");
+    expect(formatHours(60 * 60_000)).toBe("1.0h");
+  });
+
+  it("clamps negative durations to zero", () => {
+    // A negative duration is a corrupt row, not a measurement; "-30m" on the
+    // page reads like one.
+    expect(formatHours(-30 * 60_000)).toBe("0m");
+    expect(formatHours(-5 * H)).toBe("0m");
+    expect(formatHours(0)).toBe("0m");
   });
 
   it("formats elapsed like now-playing-bar", () => {
@@ -222,5 +377,51 @@ describe("slugify", () => {
   it("handles the real category names", () => {
     expect(slugify("Islam")).toBe("islam");
     expect(slugify("Oddjob")).toBe("oddjob");
+  });
+});
+
+describe("slugify — KNOWN DEFECT, characterized not endorsed", () => {
+  // These assertions pin CURRENT behavior so the defect is visible in the suite
+  // and the eventual fix is verifiable. None of them describes desired
+  // behavior. /s/[subject] resolves a subject by slug with first-match-wins, so
+  // every collision below silently routes one category's page to another's
+  // numbers, and an empty slug matches nothing at all. The real fix is to route
+  // by category id, which lives in the page components — not here.
+
+  it("collides on names that differ only in stripped punctuation", () => {
+    // "C++" and "C#" are two different subjects with one URL between them.
+    expect(slugify("C++")).toBe("c");
+    expect(slugify("C#")).toBe("c");
+    expect(slugify("C++")).toBe(slugify("C#"));
+  });
+
+  it("collides on a display name and its own slug", () => {
+    expect(slugify("Machine Learning")).toBe("machine-learning");
+    expect(slugify("machine-learning")).toBe("machine-learning");
+    expect(slugify("Machine Learning")).toBe(slugify("machine-learning"));
+  });
+
+  it("collides on names differing only in separators", () => {
+    expect(slugify("Deep Work")).toBe(slugify("deep/work"));
+    expect(slugify("Deep Work")).toBe(slugify("Deep_Work"));
+  });
+
+  it("produces an empty slug for non-ASCII names", () => {
+    // Every non-Latin category name maps to the same unroutable "" slug.
+    expect(slugify("日本語")).toBe("");
+    expect(slugify("Русский")).toBe("");
+    expect(slugify("العربية")).toBe("");
+    expect(slugify("日本語")).toBe(slugify("Русский"));
+  });
+
+  it("strips accents to nothing rather than transliterating them", () => {
+    // "Café" should slug to "cafe"; instead the accented letter is a separator.
+    expect(slugify("Café")).toBe("caf");
+    expect(slugify("Über")).toBe("ber");
+  });
+
+  it("produces an empty slug for punctuation-only names", () => {
+    expect(slugify("???")).toBe("");
+    expect(slugify("   ")).toBe("");
   });
 });

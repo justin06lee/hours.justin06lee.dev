@@ -52,11 +52,25 @@ export function unionMs(intervals: readonly Interval[]): number {
 
 /** Total time of a set of intervals, counting overlap in full. */
 export function rawMs(intervals: readonly Interval[]): number {
-  return intervals.reduce(
-    (sum, i) => sum + Math.max(0, (Number.isFinite(i.end) ? i.end : i.start) - i.start),
-    0,
-  );
+  return intervals.reduce((sum, i) => {
+    // Guard `start` the same way mergeIntervals does. `Math.max(0, NaN)` is
+    // NaN, so an unguarded start let one corrupt row turn the whole sum — and
+    // every figure derived from it — into NaN. A non-finite `end` still means
+    // "no measurable duration" rather than "drop the row", which is what a
+    // still-running entry looks like here.
+    if (!Number.isFinite(i.start)) return sum;
+    return sum + Math.max(0, (Number.isFinite(i.end) ? i.end : i.start) - i.start);
+  }, 0);
 }
+
+/**
+ * Upper bound on the segments one span may produce, ~27 years of days. Well
+ * past any span a human could plausibly log, but high enough that a timer left
+ * running for a year or two is still split in full rather than truncated. The
+ * bound exists only so a corrupt row (an end far in the future, or a clock
+ * skew) can't pin a request; hitting it is a bug, and says so out loud.
+ */
+const MAX_DAY_SEGMENTS = 10_000;
 
 /**
  * Splits a span across day boundaries in the given timezone, so a session
@@ -69,10 +83,8 @@ export function splitByDay(
 ): { date: string; start: number; end: number }[] {
   const out: { date: string; start: number; end: number }[] = [];
   let cursor = span.start;
-  // Bounded so a corrupt row with an absurd span can't spin here. 400 segments
-  // is far past any real session.
   let guard = 0;
-  while (cursor < span.end && guard++ < 400) {
+  while (cursor < span.end && guard++ < MAX_DAY_SEGMENTS) {
     const date = epochToDateInTz(cursor, timezone);
     // Walk to the instant the date string flips: coarse hour steps first, then
     // minute steps to land on the boundary. Stepping beats computing midnight
@@ -83,9 +95,32 @@ export function splitByDay(
         edge += step;
       }
     }
-    const segmentEnd = Math.min(span.end, edge + 60_000);
+    // The ladder used to stop here and round up a whole minute, which lands the
+    // split at `start + n·60000` rather than at midnight: a span opened at
+    // 23:00:37 local cut the day at 00:00:37, crediting 37 seconds of the new
+    // day to the old one. Binary-search the residual minute instead of adding
+    // 1s/1ms rungs — a 1ms rung would cost up to 1000 Intl lookups per segment,
+    // this costs a fixed ~16 and still lands on the exact millisecond.
+    let lo = edge; // known to still read `date`
+    let hi = Math.min(span.end, edge + 60_000); // span.end, or the first instant that doesn't
+    while (hi - lo > 1) {
+      const mid = lo + Math.floor((hi - lo) / 2);
+      if (epochToDateInTz(mid, timezone) === date) lo = mid;
+      else hi = mid;
+    }
+    const segmentEnd = Math.min(span.end, lo + 1);
     if (segmentEnd > cursor) out.push({ date, start: cursor, end: segmentEnd });
     cursor = segmentEnd;
+  }
+  // Truncation silently loses time — the heatmap and the headline total (which
+  // doesn't route through here) then disagree with nothing to explain why. Warn
+  // rather than throw: one bad row must not take the whole page down.
+  if (cursor < span.end) {
+    console.warn(
+      `splitByDay: span ${span.start}–${span.end} exceeds ${MAX_DAY_SEGMENTS} day segments; ` +
+        `truncated at ${cursor} (${epochToDateInTz(cursor, timezone)}). ` +
+        `Daily totals for this entry are incomplete.`,
+    );
   }
   return out;
 }
@@ -133,11 +168,17 @@ export function computeStreak(
   return { current, best: Math.max(best, current), days };
 }
 
-/** Formats ms as a compact hours label: `384.8h`, `42m`. */
+/** Formats ms as a compact hours label: `384.8h`, `42m`. Negatives clamp to 0. */
 export function formatHours(ms: number): string {
-  const hours = ms / MS_PER_HOUR;
-  if (hours >= 1) return `${hours.toFixed(1)}h`;
-  return `${Math.round(ms / 60_000)}m`;
+  // Clamp first: a negative duration is a data error, and "-30m" on the page
+  // reads as a real measurement rather than as the bug it is.
+  const safe = Math.max(0, ms);
+  // Round to minutes *before* choosing the unit. Gating on `hours >= 1` first
+  // meant 59.5–59.99 min failed the hour test, then rounded up to a label of
+  // "60m" — a value the minutes format can never legitimately produce.
+  const minutes = Math.round(safe / 60_000);
+  if (minutes >= 60) return `${(safe / MS_PER_HOUR).toFixed(1)}h`;
+  return `${minutes}m`;
 }
 
 /** Formats ms as `1h 2m` / `2m 3s` / `4s`, matching now-playing-bar. */
