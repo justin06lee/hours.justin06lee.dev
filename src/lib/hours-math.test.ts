@@ -8,6 +8,7 @@ import {
   formatHours,
   formatElapsed,
   slugify,
+  uniqueSlugs,
   MS_PER_HOUR,
 } from "@/lib/hours-math";
 
@@ -380,13 +381,15 @@ describe("slugify", () => {
   });
 });
 
-describe("slugify — KNOWN DEFECT, characterized not endorsed", () => {
-  // These assertions pin CURRENT behavior so the defect is visible in the suite
-  // and the eventual fix is verifiable. None of them describes desired
-  // behavior. /s/[subject] resolves a subject by slug with first-match-wins, so
-  // every collision below silently routes one category's page to another's
-  // numbers, and an empty slug matches nothing at all. The real fix is to route
-  // by category id, which lives in the page components — not here.
+describe("slugify — the collisions uniqueSlugs exists to resolve", () => {
+  // slugify is the right base transform and these assertions are true of it by
+  // design: it is a lossy projection of a name onto [a-z0-9-], so distinct names
+  // can and do land on the same slug. What was broken was using that projection
+  // directly as a URL key — /s/[subject] resolved subjects first-match-wins, so
+  // each collision below served one category's numbers under another's name and
+  // left the loser unreachable, and an empty slug matched nothing at all.
+  // uniqueSlugs (below) layers uniqueness on top; this block documents exactly
+  // which inputs make that layer necessary.
 
   it("collides on names that differ only in stripped punctuation", () => {
     // "C++" and "C#" are two different subjects with one URL between them.
@@ -423,5 +426,115 @@ describe("slugify — KNOWN DEFECT, characterized not endorsed", () => {
   it("produces an empty slug for punctuation-only names", () => {
     expect(slugify("???")).toBe("");
     expect(slugify("   ")).toBe("");
+  });
+});
+
+describe("uniqueSlugs", () => {
+  // Real ids are UUIDs; any stable string works, the suffix is hashed from it.
+  const cpp = { id: "11111111-1111-4111-8111-111111111111", name: "C++" };
+  const csharp = { id: "22222222-2222-4222-8222-222222222222", name: "C#" };
+  const cobol = { id: "33333333-3333-4333-8333-333333333333", name: "C  !" };
+
+  /** Every slug present, non-empty, and distinct — the whole point of the fn. */
+  const expectUsable = (slugs: string[]) => {
+    for (const s of slugs) expect(s).not.toBe("");
+    expect(new Set(slugs).size).toBe(slugs.length);
+  };
+
+  it("leaves non-colliding names exactly where slugify put them", () => {
+    // The common case must not churn a single existing URL.
+    const subjects = [
+      { id: "a", name: "Islam" },
+      { id: "b", name: "Oddjob" },
+      { id: "c", name: "Machine Learning" },
+    ];
+    expect(uniqueSlugs(subjects)).toEqual(subjects.map((s) => slugify(s.name)));
+  });
+
+  it("gives C++ and C# separate URLs, first claimant keeps the bare slug", () => {
+    const slugs = uniqueSlugs([cpp, csharp]);
+    expect(slugs[0]).toBe("c");
+    expect(slugs[1]).not.toBe("c");
+    expect(slugs[1].startsWith("c-")).toBe(true);
+    expectUsable(slugs);
+  });
+
+  it("separates a display name from its own slug written out", () => {
+    const slugs = uniqueSlugs([
+      { id: "a", name: "Machine Learning" },
+      { id: "b", name: "machine-learning" },
+    ]);
+    expect(slugs[0]).toBe("machine-learning");
+    expect(slugs[1].startsWith("machine-learning-")).toBe(true);
+    expectUsable(slugs);
+  });
+
+  it("resolves a three-way collision", () => {
+    const slugs = uniqueSlugs([cpp, csharp, cobol]);
+    expect(slugs[0]).toBe("c");
+    expectUsable(slugs);
+  });
+
+  it("gives names with no ASCII alphanumerics a usable slug anyway", () => {
+    // These all slugify to "", which does not match the dynamic segment at all:
+    // the link rendered as /s/ and 404'd on a category with real hours on it.
+    const slugs = uniqueSlugs([
+      { id: "a", name: "日本語" },
+      { id: "b", name: "Русский" },
+      { id: "c", name: "!!!" },
+      { id: "d", name: "   " },
+    ]);
+    for (const s of slugs) expect(s).toMatch(/^subject-[a-z0-9]+$/);
+    expectUsable(slugs);
+  });
+
+  it("is deterministic across calls", () => {
+    const subjects = [cpp, csharp, cobol, { id: "d", name: "日本語" }];
+    expect(uniqueSlugs(subjects)).toEqual(uniqueSlugs(subjects));
+  });
+
+  it("does not change an existing subject's slug when an unrelated one appears", () => {
+    // The reason the suffix is hashed from the id and not from a counter: with
+    // a counter, C#'s URL would depend on how many other subjects sorted above
+    // it, so logging an hour of chess would silently break every inbound link.
+    const before = uniqueSlugs([cpp, csharp]);
+    const after = uniqueSlugs([
+      { id: "z", name: "Chess" },
+      cpp,
+      { id: "y", name: "Islam" },
+      csharp,
+    ]);
+    expect(after[1]).toBe(before[0]);
+    expect(after[3]).toBe(before[1]);
+  });
+
+  it("resolves a generated suffix that collides with a real name's base slug", () => {
+    // Someone can legitimately name a category exactly what the suffixer would
+    // have produced. The base claimant wins and the suffixed entry lengthens
+    // its hash — the one case where an added subject does move another's URL,
+    // and unavoidable, since collision-freedom is a property of the whole set.
+    const suffixed = uniqueSlugs([cpp, csharp])[1];
+    const decoy = { id: "44444444-4444-4444-8444-444444444444", name: suffixed };
+    const slugs = uniqueSlugs([cpp, decoy, csharp]);
+    expect(slugs[0]).toBe("c");
+    expect(slugs[1]).toBe(suffixed);
+    expect(slugs[2]).not.toBe(suffixed);
+    expect(slugs[2].startsWith(suffixed)).toBe(true);
+    expectUsable(slugs);
+  });
+
+  it("leaves the uncategorized bucket unaddressable and out of the running", () => {
+    // id null is the no-category bucket: never linked, so it must never claim
+    // a slug a real category could have had.
+    const slugs = uniqueSlugs([
+      { id: null, name: "uncategorized" },
+      { id: "a", name: "Uncategorized" },
+    ]);
+    expect(slugs[0]).toBe("");
+    expect(slugs[1]).toBe("uncategorized");
+  });
+
+  it("returns nothing for an empty list", () => {
+    expect(uniqueSlugs([])).toEqual([]);
   });
 });

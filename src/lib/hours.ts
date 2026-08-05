@@ -8,7 +8,7 @@ import { db, initDb } from "@/lib/db";
 import type { DbCalendarActual, DbCalendarCategory } from "@/lib/db";
 import { CATEGORY_LIST_SQL, rowToCategory } from "@/lib/calendar-categories";
 import { SITE_CONFIG_SQL, parseSiteConfigRows, resolveTimezone } from "@/lib/site-config";
-import { type Interval, splitByDay, unionMs } from "@/lib/hours-math";
+import { type Interval, splitByDay, unionMs, uniqueSlugs } from "@/lib/hours-math";
 
 // Re-exported so callers have one import for "everything hours".
 export * from "@/lib/hours-math";
@@ -29,6 +29,14 @@ export type HoursEntry = {
 export type Subject = {
   id: string | null;
   name: string;
+  /**
+   * URL segment for /s/[subject], unique across the whole subject list — see
+   * uniqueSlugs. Carried on the subject rather than recomputed per call site so
+   * the link the homepage renders and the lookup the subject page performs are
+   * literally the same string and cannot drift. Empty for the uncategorized
+   * bucket, which has no id and is deliberately not addressable.
+   */
+  slug: string;
   color: string;
   archived: boolean;
   /** Full time, overlap included. */
@@ -160,7 +168,7 @@ export const getHoursOverview = cache(async (nowMs: number = Date.now()): Promis
     if (lastAt === null || e.endAt > lastAt) lastAt = e.endAt;
   }
 
-  const subjects: Subject[] = [...buckets.entries()]
+  const ranked: Omit<Subject, "slug">[] = [...buckets.entries()]
     .map(([id, intervals]) => {
       const cat = id === null ? null : byId.get(id);
       const m = meta.get(id)!;
@@ -178,6 +186,13 @@ export const getHoursOverview = cache(async (nowMs: number = Date.now()): Promis
       };
     })
     .sort((a, b) => b.ms - a.ms);
+
+  // Assigned once, over the full list and in final display order, so that the
+  // busiest of two colliding subjects is the one that keeps the bare slug and
+  // every consumer reads the same answer. Sorting first is what makes the
+  // choice depend on the data rather than on Map insertion order.
+  const slugs = uniqueSlugs(ranked);
+  const subjects: Subject[] = ranked.map((s, i) => ({ ...s, slug: slugs[i] }));
 
   const allIntervals = entries.map((e) => ({ start: e.startAt, end: e.endAt }));
   const totalMs = unionMs(allIntervals);

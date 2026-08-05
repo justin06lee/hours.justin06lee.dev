@@ -3,7 +3,7 @@ import { Streak } from "@/components/chrome/streak";
 import { HoursBarList, HoursHeatmap } from "@/components/hours-charts";
 import { FadeIn } from "@/components/chrome/fade-in";
 import { getHoursOverview } from "@/lib/hours";
-import { computeStreak, formatHours, MS_PER_HOUR, slugify } from "@/lib/hours-math";
+import { computeStreak, formatHours, MS_PER_HOUR } from "@/lib/hours-math";
 import { todayInTz } from "@/lib/calendar-dates";
 import { EntryList } from "@/components/entry-list";
 import { SiteHeader } from "@/components/site-header";
@@ -30,7 +30,9 @@ export default async function HomePage() {
     label: s.name.toLowerCase(),
     value: s.ms / MS_PER_HOUR,
     color: s.color,
-    href: s.id ? `/s/${slugify(s.name)}` : undefined,
+    // s.slug, not slugify(s.name): the overview de-duplicates slugs across the
+    // whole list, so this is the one string /s/[subject] will match on.
+    href: s.id ? `/s/${s.slug}` : undefined,
   }));
 
   const daysTracked = activeDates.size;

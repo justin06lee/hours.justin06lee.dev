@@ -200,3 +200,98 @@ export function slugify(name: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
 }
+
+/** Characters of id-derived hash appended when two names slug to the same thing. */
+const SLUG_SUFFIX_LEN = 6;
+
+/** Stands in for the base slug when a name has no ASCII alphanumerics at all. */
+const SLUG_EMPTY_BASE = "subject";
+
+/**
+ * Deterministic, id-derived entropy for disambiguating slugs: two 32-bit FNV-1a
+ * passes with different multipliers, each rendered base36 and zero-padded to a
+ * fixed 7 characters so that taking the first N characters is stable regardless
+ * of the numeric value. Hashing rather than slicing the id keeps this correct
+ * for any id shape — UUIDs today, anything tomorrow — and gives ~2 billion
+ * distinct 6-character suffixes, so a suffix clash between two real categories
+ * is not something that happens.
+ */
+function slugHash(id: string): string {
+  let a = 0x811c9dc5;
+  let b = 0xcbf29ce4;
+  for (let i = 0; i < id.length; i++) {
+    const c = id.charCodeAt(i);
+    a = Math.imul(a ^ c, 0x01000193);
+    b = Math.imul(b ^ c, 0x85ebca6b);
+  }
+  return (a >>> 0).toString(36).padStart(7, "0") + (b >>> 0).toString(36).padStart(7, "0");
+}
+
+/**
+ * One collision-free slug per entry, in input order.
+ *
+ * `slugify` alone is not injective — "C++" and "C#" both become "c", and
+ * "Machine Learning" and "machine-learning" both become "machine-learning" —
+ * so a page that resolves a subject by scanning for the first matching slug
+ * serves one category's numbers under another category's name, and leaves the
+ * loser permanently unreachable. The database's UNIQUE(LOWER(name)) index
+ * cannot help: the names differ, it is the slugs that don't.
+ *
+ * The first entry to claim a base slug keeps it bare, so the overwhelmingly
+ * common no-collision case produces exactly the URLs it always has and no
+ * existing link breaks. Losers get a suffix derived from their own **id**, not
+ * from a counter: a counter would make a subject's URL a function of which
+ * *other* subjects exist and how they happen to sort, so renaming an unrelated
+ * category — or merely logging enough hours against it to move it up the
+ * ms-ordered list — would silently rewrite this subject's URL and 404 every
+ * inbound link to it. Keyed on the id, a URL changes only when that subject's
+ * own name changes, which is the one time a reader would expect it to.
+ *
+ * A suffixed slug can still collide with something else in the set — a real
+ * category could legitimately be named "C c1a2b3", and two entries whose names
+ * both slug to "" would otherwise both land on the same fallback. So suffixed
+ * candidates are checked against everything already claimed and lengthened, one
+ * hash character at a time, until one is free; the full 14-character hash is
+ * the last rung and is unique per id for any input this site will ever hold.
+ *
+ * An entry with a null id is the uncategorized bucket. It is never linked and
+ * must never be resolvable, so it gets "" and takes part in no claim — that
+ * also stops it from stealing the base slug from a real category that happens
+ * to be named "uncategorized".
+ */
+export function uniqueSlugs(entries: readonly { id: string | null; name: string }[]): string[] {
+  const out: string[] = new Array(entries.length).fill("");
+  const bases = entries.map((e) => (e.id === null ? "" : slugify(e.name)));
+  const taken = new Set<string>();
+
+  // First pass over the whole list before any suffixing, so a later entry's
+  // collision can never displace an earlier entry's bare slug.
+  for (let i = 0; i < entries.length; i++) {
+    const base = bases[i];
+    if (entries[i].id === null || base === "" || taken.has(base)) continue;
+    taken.add(base);
+    out[i] = base;
+  }
+
+  for (let i = 0; i < entries.length; i++) {
+    const id = entries[i].id;
+    if (id === null || out[i] !== "") continue;
+    const base = bases[i] || SLUG_EMPTY_BASE;
+    const hash = slugHash(id);
+    let slug = "";
+    for (let len = SLUG_SUFFIX_LEN; len <= hash.length; len++) {
+      const candidate = `${base}-${hash.slice(0, len)}`;
+      if (!taken.has(candidate)) {
+        slug = candidate;
+        break;
+      }
+    }
+    // Unreachable short of two entries sharing an id: every rung above was
+    // taken. Keep extending rather than throw — an ugly URL beats a dead page.
+    while (slug === "" || taken.has(slug)) slug = `${slug || `${base}-${hash}`}-${hash}`;
+    taken.add(slug);
+    out[i] = slug;
+  }
+
+  return out;
+}
