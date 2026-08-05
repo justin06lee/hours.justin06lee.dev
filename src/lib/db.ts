@@ -150,14 +150,27 @@ const COLUMN_SPECS: ColumnSpec[] = [
   { table: "calendar_actuals", column: "track", type: "INTEGER NOT NULL DEFAULT 0" },
 ];
 
+// Runs on EVERY cold start, including the fingerprint fast path — it rides
+// along in the probe batch below, so it costs no extra round trip.
+//
+// It has to be unconditional because this database is shared with
+// justin06lee.dev. The old global index forbids exactly the second concurrent
+// lane that this app's per-lane index exists to allow, so if the sibling app
+// ever re-creates it, a fingerprint-gated drop would never run again and
+// starting lane 1 while lane 0 runs would fail forever — reported to the user
+// as "that lane was just started somewhere else", with no recovery short of a
+// code edit. Dropping every time is a cheap no-op and closes that hole.
+//
+// Safe on a fresh database too: `DROP INDEX IF EXISTS` resolves the index by
+// name and no-ops when it is absent, whether or not the table exists yet.
+const DROP_LEGACY_RUNNING_INDEX = `DROP INDEX IF EXISTS idx_calendar_actuals_running`;
+
 const POST_STEPS: string[] = [
-  // The running-row invariant is now per-lane: at most one open row PER track
-  // rather than one globally. The old global index has to be dropped first —
-  // it forbids exactly the second concurrent lane the new one exists to
-  // allow. Both statements are idempotent, and both must run after the
-  // `calendar_actuals.track` migration so the indexed column is guaranteed to
-  // exist — hence a separate batch, issued after the ALTERs.
-  `DROP INDEX IF EXISTS idx_calendar_actuals_running`,
+  // The running-row invariant is per-lane: at most one open row PER track
+  // rather than one globally. This must run after the `calendar_actuals.track`
+  // migration so the indexed column is guaranteed to exist — hence a separate
+  // batch, issued after the ALTERs — and after DROP_LEGACY_RUNNING_INDEX,
+  // which the probe batch has already applied by this point.
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_actuals_running_track
           ON calendar_actuals(track) WHERE end_at IS NULL`,
   // One-time cleanup of pre-2026-05 fallback rows. The old shape was
@@ -183,7 +196,15 @@ const SLEEP_COLOR = "#5b5b8a";
 // ship a schema edit that silently never runs.
 const SCHEMA_FINGERPRINT = createHash("sha256")
   .update(
-    JSON.stringify([SCHEMA_DDL, COLUMN_SPECS, POST_STEPS, SLEEP_SEED_SQL, SLEEP_CATEGORY_ID, SLEEP_COLOR]),
+    JSON.stringify([
+      SCHEMA_DDL,
+      COLUMN_SPECS,
+      DROP_LEGACY_RUNNING_INDEX,
+      POST_STEPS,
+      SLEEP_SEED_SQL,
+      SLEEP_CATEGORY_ID,
+      SLEEP_COLOR,
+    ]),
   )
   .digest("hex")
   .slice(0, 16);
@@ -221,11 +242,12 @@ async function doInit(): Promise<void> {
   const probe = await db.batch(
     [
       `CREATE TABLE IF NOT EXISTS schema_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+      DROP_LEGACY_RUNNING_INDEX,
       `SELECT value FROM schema_state WHERE key = 'fingerprint'`,
     ],
     "write",
   );
-  if (probe[1].rows[0]?.value === SCHEMA_FINGERPRINT) return;
+  if (probe[2].rows[0]?.value === SCHEMA_FINGERPRINT) return;
 
   // Slow path. Two cold workers can reach here at once and both migrate; that
   // is safe because every statement below is idempotent (CREATE/DROP ... IF
@@ -256,10 +278,34 @@ async function doInit(): Promise<void> {
     ]),
   );
 
-  const alters = COLUMN_SPECS.filter((s) => !existing.get(s.table)!.has(s.column)).map(
-    (s) => `ALTER TABLE ${s.table} ADD COLUMN ${s.column} ${s.type}`,
-  );
-  if (alters.length > 0) await db.batch(alters, "write");
+  // Issued one at a time rather than as a batch, and this is the one place we
+  // deliberately spend round trips instead of saving them.
+  //
+  // `ALTER TABLE ... ADD COLUMN` is the only non-idempotent statement in this
+  // migration: there is no `IF NOT EXISTS` form, and the PRAGMA read above is
+  // a separate round trip, so two cold workers can both observe a column
+  // missing and both try to add it. In a batch the loser's `duplicate column
+  // name` aborts and rolls back the whole transaction, doInit rejects, the
+  // request 500s, and — because the fingerprint is never written — it repeats
+  // on the next cold start too. Individually, the loser swallows the error for
+  // the column that already exists and the rest still apply.
+  //
+  // The cost is bounded and paid at most once per database: this loop is empty
+  // whenever the columns are already present, which is every run after the
+  // first.
+  const alters = COLUMN_SPECS.filter((s) => !existing.get(s.table)!.has(s.column));
+  for (const s of alters) {
+    try {
+      await db.execute({
+        sql: `ALTER TABLE ${s.table} ADD COLUMN ${s.column} ${s.type}`,
+        args: [],
+      });
+    } catch (e) {
+      // Lost the race to a concurrent worker — the column is there, which is
+      // all we wanted. Anything else is a real failure and must propagate.
+      if (!/duplicate column name/i.test((e as { message?: string })?.message ?? "")) throw e;
+    }
+  }
 
   // Everything that has to happen after the columns exist, in one hop. Order
   // is preserved within a batch, so the index rebuild still lands before the
