@@ -32,6 +32,10 @@ export async function generateMetadata({
   return {
     title: match.name.toLowerCase(),
     description: `${formatHours(match.ms)} logged on ${match.name.toLowerCase()}`,
+    // Per-page, because root-layout metadata is inherited shallowly: a
+    // canonical declared there would mark every subject page a duplicate of
+    // the homepage.
+    alternates: { canonical: `/s/${subject}` },
   };
 }
 
