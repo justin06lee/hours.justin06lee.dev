@@ -3,10 +3,11 @@
  * hours-math.ts; this module only loads rows and applies it.
  */
 
+import { cache } from "react";
 import { db, initDb } from "@/lib/db";
-import type { DbCalendarActual } from "@/lib/db";
-import { listCategories } from "@/lib/calendar-categories";
-import { getSiteConfig, resolveTimezone } from "@/lib/site-config";
+import type { DbCalendarActual, DbCalendarCategory } from "@/lib/db";
+import { CATEGORY_LIST_SQL, rowToCategory } from "@/lib/calendar-categories";
+import { SITE_CONFIG_SQL, parseSiteConfigRows, resolveTimezone } from "@/lib/site-config";
 import { type Interval, splitByDay, unionMs } from "@/lib/hours-math";
 
 // Re-exported so callers have one import for "everything hours".
@@ -56,48 +57,75 @@ export type HoursOverview = {
 };
 
 /**
- * Loads every actual, newest first. This site is one person's log — tens of
+ * Every actual, newest first. This site is one person's log — tens of
  * thousands of rows at the very worst — so aggregating in JS keeps the
  * interval math readable and exact. Move the sums into SQL only if that stops
  * being true; the union step would still have to happen here.
  */
-async function loadEntries(nowMs: number): Promise<HoursEntry[]> {
-  await initDb();
-  const result = await db.execute({
-    sql: `SELECT id, date, category_id, title, notes, start_at, end_at, track
+const ENTRY_LIST_SQL = `SELECT id, date, category_id, title, notes, start_at, end_at, track
           FROM calendar_actuals
-          ORDER BY start_at DESC`,
-    args: [],
-  });
-  const rows = result.rows as unknown as Pick<
-    DbCalendarActual,
-    "id" | "date" | "category_id" | "title" | "notes" | "start_at" | "end_at" | "track"
-  >[];
+          ORDER BY start_at DESC`;
 
-  return rows.map((r) => {
-    const running = r.end_at === null;
-    return {
-      id: r.id,
-      categoryId: r.category_id,
-      title: r.title,
-      notes: r.notes,
-      startAt: Number(r.start_at),
-      // A running row has no end yet; clamp to now so live time counts. Guard
-      // against a start in the future (clock skew) collapsing to negative.
-      endAt: running ? Math.max(Number(r.start_at), nowMs) : Number(r.end_at),
-      running,
-      track: Number(r.track ?? 0),
-      date: r.date,
-    };
-  });
+type DbEntryRow = Pick<
+  DbCalendarActual,
+  "id" | "date" | "category_id" | "title" | "notes" | "start_at" | "end_at" | "track"
+>;
+
+function rowToEntry(r: DbEntryRow, nowMs: number): HoursEntry {
+  const running = r.end_at === null;
+  return {
+    id: r.id,
+    categoryId: r.category_id,
+    title: r.title,
+    notes: r.notes,
+    startAt: Number(r.start_at),
+    // A running row has no end yet; clamp to now so live time counts. Guard
+    // against a start in the future (clock skew) collapsing to negative.
+    endAt: running ? Math.max(Number(r.start_at), nowMs) : Number(r.end_at),
+    running,
+    track: Number(r.track ?? 0),
+    date: r.date,
+  };
 }
 
-export async function getHoursOverview(nowMs: number = Date.now()): Promise<HoursOverview> {
-  const timezone = resolveTimezone(await getSiteConfig());
-  const [entries, categories] = await Promise.all([
-    loadEntries(nowMs),
-    listCategories(),
-  ]);
+/**
+ * The hottest path in the app: the homepage and every subject page are
+ * force-dynamic, so this runs uncached on literally every page view.
+ *
+ * Wrapped in React `cache()` because the subject page calls it twice per
+ * request — once in `generateMetadata()` and once in the component — and Next
+ * runs both. React keys the cache on the argument list, and both call sites
+ * pass zero arguments, so they hit the same entry and the log is loaded and
+ * aggregated once instead of twice. Keeping the `Date.now()` default *inside*
+ * the function (rather than resolving it at each call site) is what makes that
+ * work, and it fixes a real inconsistency too: metadata and body used to
+ * compute running-entry durations against two different "now" values a few
+ * milliseconds apart. The cache is per-request — React discards it at the end
+ * of the render — so pages never serve a stale "now" from an earlier request.
+ */
+export const getHoursOverview = cache(async (nowMs: number = Date.now()): Promise<HoursOverview> => {
+  // All three reads go out as one batch: a single network round trip to Turso
+  // instead of three. Ordering used to force two serial waves — the timezone
+  // was awaited before the rows — but nothing actually needs it first; it is
+  // only consumed by splitByDay far below, after the rows are already in hand.
+  // "read" is a read-only transaction: the statements see one consistent
+  // snapshot, which also means categories can't shift out from under the
+  // entries that reference them.
+  await initDb();
+  const [configRes, entriesRes, categoriesRes] = await db.batch(
+    [
+      { sql: SITE_CONFIG_SQL, args: [] },
+      { sql: ENTRY_LIST_SQL, args: [] },
+      { sql: CATEGORY_LIST_SQL, args: [] },
+    ],
+    "read",
+  );
+
+  const timezone = resolveTimezone(
+    parseSiteConfigRows(configRes.rows as unknown as { key: string; value: string }[]),
+  );
+  const entries = (entriesRes.rows as unknown as DbEntryRow[]).map((r) => rowToEntry(r, nowMs));
+  const categories = (categoriesRes.rows as unknown as DbCalendarCategory[]).map(rowToCategory);
 
   const byId = new Map(categories.map((c) => [c.id, c]));
 
@@ -165,5 +193,5 @@ export async function getHoursOverview(nowMs: number = Date.now()): Promise<Hour
     lastAt: entries.length ? Math.max(...entries.map((e) => e.endAt)) : null,
     runningCount: entries.filter((e) => e.running).length,
   };
-}
+});
 

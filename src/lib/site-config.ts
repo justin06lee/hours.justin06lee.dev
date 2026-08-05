@@ -39,12 +39,24 @@ const EMPTY_CONFIG: SiteConfig = {
   prayerLocation: { city: "", country: "", method: 2, timezone: DEFAULT_TIMEZONE, latitude: null, longitude: null },
 };
 
-export const getSiteConfig = cache(async (): Promise<SiteConfig> => {
-  await initDb();
+/**
+ * The canonical site_config read. Exported alongside `parseSiteConfigRows` so
+ * hours.ts can fold this row fetch into its own batched read without keeping a
+ * second copy of the SQL that could drift from this one.
+ */
+export const SITE_CONFIG_SQL = "SELECT key, value FROM site_config";
 
-  const result = await db.execute("SELECT key, value FROM site_config");
-  const rows = result.rows as unknown as { key: string; value: string }[];
-
+/**
+ * Pure row-array -> SiteConfig decode, split out of `getSiteConfig` so a caller
+ * that already has the rows in hand (hours.ts fetches them as part of one
+ * batch) can decode them without a second round trip.
+ *
+ * site_config is a key/value table of JSON blobs, so every value is decoded
+ * defensively: a missing key and a malformed one both fall back to the same
+ * empty default rather than throwing. A half-broken config row should degrade
+ * one field, never take down the page that reads it.
+ */
+export function parseSiteConfigRows(rows: { key: string; value: string }[]): SiteConfig {
   const map = new Map(rows.map((r) => [r.key, r.value]));
   return {
     description: (() => { try { return map.has("description") ? JSON.parse(map.get("description")!) : EMPTY_CONFIG.description; } catch { return EMPTY_CONFIG.description; } })(),
@@ -52,6 +64,13 @@ export const getSiteConfig = cache(async (): Promise<SiteConfig> => {
     pfp: (() => { try { return map.has("pfp") ? { ...EMPTY_CONFIG.pfp, ...JSON.parse(map.get("pfp")!) } : EMPTY_CONFIG.pfp; } catch { return EMPTY_CONFIG.pfp; } })(),
     prayerLocation: (() => { try { return map.has("prayerLocation") ? { ...EMPTY_CONFIG.prayerLocation, ...JSON.parse(map.get("prayerLocation")!) } : EMPTY_CONFIG.prayerLocation; } catch { return EMPTY_CONFIG.prayerLocation; } })(),
   };
+}
+
+export const getSiteConfig = cache(async (): Promise<SiteConfig> => {
+  await initDb();
+
+  const result = await db.execute(SITE_CONFIG_SQL);
+  return parseSiteConfigRows(result.rows as unknown as { key: string; value: string }[]);
 });
 
 export function resolveTimezone(config: SiteConfig): string {
