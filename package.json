@@ -3,13 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "predev": "bun run icons",
     "dev": "next dev",
+    "prebuild": "bun run icons",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "icons": "python3 design/favicon/generate.py > src/app/icon.svg && node design/favicon/build.mjs"
+    "icons": "node scripts/build-icons.mjs",
+    "icons:draw": "python3 design/favicon/generate.py > src/app/icon.svg && bun run icons"
   },
   "dependencies": {
     "@libsql/client": "^0.17.4",
