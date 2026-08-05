@@ -1,5 +1,6 @@
 import "server-only";
 import { timingSafeEqual, randomUUID } from "crypto";
+import { cache } from "react";
 import { NextRequest, NextResponse } from "next/server";
 import { db, initDb } from "@/lib/db";
 
@@ -51,20 +52,53 @@ const SESSION_COOKIE = "admin_session";
 
 export async function createSession(): Promise<string> {
   await initDb();
-  // Prune expired sessions
-  await db.execute({
-    sql: "DELETE FROM sessions WHERE created_at < ?",
-    args: [Date.now() - SESSION_TTL],
-  });
   const token = randomUUID();
-  await db.execute({
-    sql: "INSERT INTO sessions (token, created_at) VALUES (?, ?)",
-    args: [token, Date.now()],
-  });
+  const now = Date.now();
+  // Prune expired sessions, then insert the new one — one network round trip
+  // to Turso instead of two. `batch` preserves statement order and runs the
+  // whole list in a single transaction, so the prune can never delete the row
+  // we are about to write (it only touches rows older than the TTL) and a
+  // failed insert can't leave the prune half-applied.
+  await db.batch(
+    [
+      {
+        sql: "DELETE FROM sessions WHERE created_at < ?",
+        args: [now - SESSION_TTL],
+      },
+      {
+        sql: "INSERT INTO sessions (token, created_at) VALUES (?, ?)",
+        args: [token, now],
+      },
+    ],
+    "write",
+  );
   return token;
 }
 
-export async function validateSession(token: string): Promise<boolean> {
+/**
+ * Is this session token still good? Memoized per request with React's `cache`,
+ * keyed by `token`.
+ *
+ * Why this matters: every admin check in the app funnels through here, and a
+ * single user action can check admin several times. `segmentLane()` calls
+ * `assertAdmin()`, then `stopLane()` (which asserts again), then `startLane()`
+ * (a third time) — that was three identical SELECTs against `sessions` for one
+ * button press. Page renders have the same shape. Memoizing collapses them to
+ * one query.
+ *
+ * This is NOT a security hole, and is not a cross-request cache. React's
+ * `cache` is scoped to a single request/render pass: the memo is created when
+ * the request starts and thrown away when it ends. A session revoked by
+ * another request is invisible for at most the remainder of the one request
+ * that already read it — the same window you'd get from any two DB reads that
+ * aren't in the same transaction. Nothing is cached between requests, so a
+ * revoked session is rejected on the very next one.
+ *
+ * The memoized value is the boolean result of the whole function, so the
+ * expired-session DELETE below still runs on a genuine first call within the
+ * request; only the redundant repeats are skipped.
+ */
+export const validateSession = cache(async (token: string): Promise<boolean> => {
   await initDb();
   const result = await db.execute({
     sql: "SELECT created_at FROM sessions WHERE token = ?",
@@ -77,7 +111,7 @@ export async function validateSession(token: string): Promise<boolean> {
     return false;
   }
   return true;
-}
+});
 
 export async function destroySession(token: string) {
   await initDb();
