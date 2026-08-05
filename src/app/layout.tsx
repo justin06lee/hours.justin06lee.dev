@@ -17,7 +17,6 @@ export const metadata: Metadata = {
   applicationName: "hours.justin06lee.dev",
   authors: [{ name: "justin06lee" }],
   creator: "justin06lee",
-  alternates: { canonical: "/" },
   openGraph: {
     type: "website",
     locale: "en_US",
