@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { useCombobox, type ComboboxOption } from "@/hooks/use-combobox";
 
@@ -51,6 +52,21 @@ export function Combobox<T extends string | number>({
     inputKeyDown,
   } = useCombobox({ value, options });
 
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  // The search input exists only while `open`, so every close path — Escape,
+  // outside click, Create, Clear, picking an option — unmounts the focused
+  // element and drops a keyboard user at the top of the document. Hand focus
+  // back to the trigger, but only if nothing else claimed it: an outside click
+  // that lands on another control should keep the focus it just moved.
+  const wasOpen = useRef(false);
+  useEffect(() => {
+    const justClosed = wasOpen.current && !open;
+    wasOpen.current = open;
+    if (justClosed && document.activeElement === document.body) {
+      triggerRef.current?.focus();
+    }
+  }, [open]);
+
   // Navigable rows, in render order: optional create, optional clear, then the
   // filtered options. Activating a row mirrors its onClick exactly.
   const showCreate = Boolean(onCreate);
@@ -81,6 +97,7 @@ export function Combobox<T extends string | number>({
   return (
     <div ref={containerRef} className={cn("relative", className)}>
       <button
+        ref={triggerRef}
         type="button"
         aria-label={ariaLabel}
         aria-haspopup="listbox"
@@ -109,6 +126,10 @@ export function Combobox<T extends string | number>({
           <input
             autoFocus
             role="combobox"
+            // `ariaLabel` names the trigger, not this input, so without one a
+            // screen reader announces "combobox, blank".
+            aria-label={ariaLabel ?? searchPlaceholder}
+            aria-autocomplete="list"
             aria-expanded={open}
             aria-controls={listboxId}
             aria-activedescendant={activeIndex >= 0 ? rowId(activeIndex) : undefined}

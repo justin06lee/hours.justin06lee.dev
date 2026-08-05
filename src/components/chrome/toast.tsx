@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import * as motion from "motion/react-client";
 import { AnimatePresence, useReducedMotion } from "motion/react";
 import { Check, TriangleAlert, X, type LucideIcon } from "lucide-react";
@@ -101,6 +102,10 @@ export function ToastProvider({
   const { toasts, toast, dismiss, pause, resume } = useToastStore({ duration, max });
   const reduceMotion = useReducedMotion();
 
+  // Both members are already stable, so holding the object identity keeps every
+  // `useToast()` consumer out of the re-render each add or dismiss provokes.
+  const ctx = useMemo(() => ({ toast, dismiss }), [toast, dismiss]);
+
   const fromTop = position.startsWith("top");
   // Toasts enter from the edge they're anchored to, so the motion reads as
   // sliding in from off-screen rather than drifting in from nowhere.
@@ -114,7 +119,7 @@ export function ToastProvider({
     : { opacity: 1, y: 0, scale: 1 };
 
   return (
-    <ToastContext.Provider value={{ toast, dismiss }}>
+    <ToastContext.Provider value={ctx}>
       {children}
       <ol
         aria-live="polite"

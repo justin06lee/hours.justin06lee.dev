@@ -51,7 +51,10 @@ export function useNavbar(): UseNavbarReturn {
   return {
     open,
     setOpen,
-    toggle: () => setOpen(!open),
+    // Functional update — `toggle` is handed to callers who may hold on to it
+    // (event handler, effect) past the render that created it, where `open`
+    // would be stale.
+    toggle: () => setOpen((o) => !o),
     close: () => setOpen(false),
     panelRef,
   };

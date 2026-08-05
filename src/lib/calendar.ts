@@ -1,3 +1,4 @@
+import type { InStatement, InValue } from "@libsql/client";
 import { db, initDb, type DbCalendarTask, type DbCalendarActual, type DbCalendarCategory } from "./db";
 import {
   epochToDateInTz,
@@ -7,6 +8,7 @@ import {
   intervalIntersectionMinutes,
 } from "@/lib/calendar-dates";
 import { rowToCategory, type CalendarCategory } from "./calendar-categories";
+import { SITE_CONFIG_SQL, parseSiteConfigRows, resolveTimezone } from "./site-config";
 
 // Web Crypto global — works in Node 19+, Bun, and edge runtimes.
 const randomUUID = () => globalThis.crypto.randomUUID();
@@ -119,16 +121,16 @@ function serializeFallbacks(fbs: PlanFallback[] | undefined | null): string | nu
 }
 
 /**
- * A statement in the shape `db.batch` wants, but with `args` typed loosely so
- * the builders below can assemble lists generically. libsql declares `args` as
- * its own `InValue` union; every value we put in one is a string, number or
- * null, so the cast in {@link batchStmts} is the same one the pre-existing
- * batch call sites already used.
+ * A statement in the shape `db.batch` wants. `args` is libsql's own `InValue`
+ * union rather than `unknown[]`, so the builders below still assemble lists
+ * generically but the compiler actually checks what goes into them — this used
+ * to be cast away with `as never`, which silenced every argument-type error the
+ * driver's signature exists to catch.
  */
-type Stmt = { sql: string; args: unknown[] };
+type Stmt = { sql: string; args: InValue[] };
 
-function batchStmts(stmts: Stmt[], mode: "read" | "write") {
-  return db.batch(stmts as never, mode);
+function batchStmts(stmts: InStatement[], mode: "read" | "write") {
+  return db.batch(stmts, mode);
 }
 
 const CATEGORY_EXISTS_SQL = "SELECT 1 FROM calendar_categories WHERE id = ? LIMIT 1";
@@ -417,10 +419,6 @@ const INSERT_ACTUAL_SQL = `INSERT INTO calendar_actuals
           (id, date, plan_id, category_id, title, start_at, end_at, track, notes, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
-const UPDATE_ACTUAL_SQL = `UPDATE calendar_actuals
-            SET category_id=?, title=?, start_at=?, end_at=?, notes=?, updated_at=?
-            WHERE id=?`;
-
 /** Only the two fields a start inherits from its plan. Doubles as the
  *  existence check, so "does this plan exist?" and "what does it say?" cost
  *  one statement between them instead of two. */
@@ -569,13 +567,19 @@ export type StartActualsResult =
     };
 
 /** Detect a violation of the partial UNIQUE index guarding one running row
- *  per track. libsql surfaces the SQLITE_CONSTRAINT_UNIQUE code on its error
- *  objects. The name check still matches the pre-parallel index name as a
- *  prefix, so it covers databases migrated in either direction. */
+ *  per track. The remote driver reports the extended code as `code`; the local
+ *  sqlite3 driver puts the base code there and the extended one in
+ *  `extendedCode`. The name check still matches the pre-parallel index name as
+ *  a prefix, so it covers databases migrated in either direction.
+ *
+ *  The bare `SQLITE_CONSTRAINT` base code is deliberately not matched. It also
+ *  covers NOT NULL, CHECK and FK failures — every one of which is a bug in this
+ *  code, and every one of which was being reported to the user as "that lane
+ *  was just started somewhere else" and then never reaching the logs. */
 function isRunningUniqueViolation(e: unknown): boolean {
   if (!e || typeof e !== "object") return false;
-  const err = e as { code?: string; message?: string };
-  if (err.code === "SQLITE_CONSTRAINT_UNIQUE" || err.code === "SQLITE_CONSTRAINT") {
+  const err = e as { code?: string; extendedCode?: string; message?: string };
+  if (err.code === "SQLITE_CONSTRAINT_UNIQUE" || err.extendedCode === "SQLITE_CONSTRAINT_UNIQUE") {
     return true;
   }
   const msg = err.message ?? "";
@@ -939,14 +943,28 @@ export type ActualPatch = Partial<{
   notes: string | null;
 }>;
 
+/**
+ * `conflict` means the row changed between this call's read and its UPDATE, so
+ * nothing was written. It is a retry, not a failure: the caller re-reads and
+ * re-applies its patch against the row as it now stands. Merging a patch onto a
+ * snapshot and writing the whole merge back cannot be made safe any other way —
+ * see {@link updateActualStmt} for what the stale snapshot used to cost.
+ */
+type UpdateActualReason =
+  | "not-found"
+  | "start-after-end"
+  | "would-overlap-running"
+  | "invalid-category"
+  | "conflict";
+
 export type UpdateActualResult =
   | { ok: true; actual: CalendarActual }
-  | { ok: false; reason: "not-found" | "start-after-end" | "would-overlap-running" | "invalid-category" };
+  | { ok: false; reason: UpdateActualReason };
 
 /** {@link updateActual}'s result under `hydrate: false` — written, not read back. */
 export type UpdateActualResultLean =
   | { ok: true; actual: null }
-  | { ok: false; reason: "not-found" | "start-after-end" | "would-overlap-running" | "invalid-category" };
+  | { ok: false; reason: UpdateActualReason };
 
 type MergedActual = {
   categoryId: string | null;
@@ -957,18 +975,23 @@ type MergedActual = {
 };
 
 /**
- * Pure merge + invariant check, split out so `updateActual` and the fused
+ * Pure invariant check, split out so `updateActual` and the fused
  * describe-then-close path in {@link segmentActuals} apply byte-identical
  * rules and return byte-identical reasons.
  *
+ * The merge exists only to validate against: the interval checks need to know
+ * what the row will look like afterwards. It is deliberately NOT returned and
+ * NOT written — {@link updateActualStmt} writes the patch, because the
+ * inherited half of a merge is a snapshot that may already be wrong.
+ *
  * `running` is whoever holds this row's lane, already fetched by the caller.
  */
-function mergeAndValidateActual(
+function validateActualPatch(
   id: string,
   existing: CalendarActual,
   patch: ActualPatch,
   running: CalendarActual | null,
-): { ok: true; merged: MergedActual } | { ok: false; reason: "start-after-end" | "would-overlap-running" } {
+): { ok: true } | { ok: false; reason: "start-after-end" | "would-overlap-running" } {
   const merged: MergedActual = {
     categoryId: patch.categoryId !== undefined ? patch.categoryId : existing.categoryId,
     title: patch.title !== undefined ? patch.title : existing.title,
@@ -985,24 +1008,116 @@ function mergeAndValidateActual(
   // running row on a DIFFERENT track is the entire point of parallel tracks
   // (coding while a workout is timed), so only same-lane collisions are
   // rejected here.
-  if (merged.endAt === null) {
-    // Becoming/staying running: no OTHER row may hold this lane.
-    if (running && running.id !== id) {
+  //
+  // Gated on the patch actually carrying `endAt`, because only a patch that
+  // changes running-ness can create a collision. An inherited `endAt` says
+  // nothing about the caller's intent and everything about how stale the read
+  // was: a pure `{ notes }` save on a row that has since been closed elsewhere
+  // still merges to `endAt: null`, which read as "this row wants the lane" and
+  // rejected the save — silently discarding text the user had just typed, over
+  // a race the save was never in.
+  if (patch.endAt !== undefined) {
+    if (merged.endAt === null) {
+      // Becoming/staying running: no OTHER row may hold this lane.
+      if (running && running.id !== id) {
+        return { ok: false, reason: "would-overlap-running" };
+      }
+    } else if (running && running.id !== id && merged.endAt > running.startAt) {
+      // Now stopped: must not span the start of this lane's running row.
       return { ok: false, reason: "would-overlap-running" };
     }
-  } else if (running && running.id !== id && merged.endAt > running.startAt) {
-    // Now stopped: must not span the start of this lane's running row.
-    return { ok: false, reason: "would-overlap-running" };
   }
 
-  return { ok: true, merged };
+  return { ok: true };
 }
 
-function updateActualStmt(id: string, merged: MergedActual, nowMs: number): Stmt {
-  return {
-    sql: UPDATE_ACTUAL_SQL,
-    args: [merged.categoryId, merged.title, merged.startAt, merged.endAt, merged.notes, nowMs, id],
-  };
+/**
+ * Builds the UPDATE from the keys the patch actually carries, and nothing else.
+ *
+ * Writing all five columns from the merge was the single worst bug in this
+ * file. `merged` is built on a read, and between that read and this UPDATE
+ * another writer can close the row; `merged.endAt` is then a stale `null`, and
+ * `SET end_at=NULL` RESURRECTS a finished entry. It gets closed again later, at
+ * a later timestamp, and the entry's duration silently grows. On a site whose
+ * whole claim is that the hours are logged honestly, a write path that inflates
+ * them is not a rough edge. Touching only the patched columns means a
+ * `{ notes }` save cannot move a clock it never mentioned.
+ *
+ * `expectUpdatedAt` closes the remaining window for the columns the patch DOES
+ * name: the row must still be the one that was read, or `rowsAffected` is 0 and
+ * the caller reports a conflict rather than overwriting a newer value.
+ *
+ * The SQL is assembled per call rather than hoisted like its neighbours because
+ * its shape is now a function of the patch. There are 32 possible SET lists and
+ * a string concat is free next to the round trip it rides in.
+ */
+function updateActualStmt(
+  id: string,
+  patch: ActualPatch,
+  nowMs: number,
+  opts?: { timezone?: string; expectUpdatedAt?: number },
+): Stmt {
+  const sets: string[] = [];
+  const args: InValue[] = [];
+  if (patch.categoryId !== undefined) {
+    sets.push("category_id=?");
+    args.push(patch.categoryId);
+  }
+  if (patch.title !== undefined) {
+    sets.push("title=?");
+    args.push(patch.title);
+  }
+  if (patch.startAt !== undefined) {
+    sets.push("start_at=?");
+    args.push(patch.startAt);
+    // `date` is derived from `start_at` at insert time and every date-filtered
+    // query trusts it, so moving a start across midnight has to move the filing
+    // date with it — otherwise the entry stays indexed under a day it no longer
+    // belongs to and disappears from the day it does.
+    if (opts?.timezone) {
+      sets.push("date=?");
+      args.push(epochToDateInTz(patch.startAt, opts.timezone));
+    }
+  }
+  if (patch.endAt !== undefined) {
+    sets.push("end_at=?");
+    args.push(patch.endAt);
+  }
+  if (patch.notes !== undefined) {
+    sets.push("notes=?");
+    args.push(patch.notes);
+  }
+  sets.push("updated_at=?");
+  args.push(nowMs);
+  args.push(id);
+
+  let sql = `UPDATE calendar_actuals SET ${sets.join(", ")} WHERE id=?`;
+  if (opts?.expectUpdatedAt !== undefined) {
+    sql += " AND updated_at=?";
+    args.push(opts.expectUpdatedAt);
+  }
+  return { sql, args };
+}
+
+/**
+ * Appends the site_config read that {@link updateActualStmt} needs to re-derive
+ * `date`, and only when some patch in this call actually moves `startAt`.
+ *
+ * The timezone is not a parameter of `updateActual`, and adding one would
+ * change a signature other modules are written against. Riding the read batch
+ * instead costs nothing: the statement travels with pre-checks that were being
+ * issued anyway, so the common case (no `startAt` in the patch) pays literally
+ * nothing and the rare case pays no extra round trip.
+ */
+function pushTimezoneRead(reads: Stmt[], needed: boolean): number {
+  return needed ? reads.push({ sql: SITE_CONFIG_SQL, args: [] }) - 1 : -1;
+}
+
+function timezoneFromRead(readRs: { rows: unknown[] }[], idx: number): string | undefined {
+  if (idx < 0) return undefined;
+  return resolveTimezone(
+    parseSiteConfigRows(readRs[idx].rows as unknown as { key: string; value: string }[]),
+  );
 }
 
 /**
@@ -1037,25 +1152,40 @@ export async function updateActual(
     ? reads.push({ sql: CATEGORY_EXISTS_SQL, args: [patch.categoryId] }) - 1
     : -1;
   const laneIdx = reads.push({ sql: RUNNING_ON_LANE_OF_SQL, args: [id] }) - 1;
+  const tzIdx = pushTimezoneRead(reads, patch.startAt !== undefined);
   const readRs = await batchStmts(reads, "read");
 
   // Check order is load-bearing: callers surface `reason` verbatim, so
   // not-found must still win over invalid-category, and both over the
   // interval checks.
-  const existing = firstActual(readRs[0]);
-  if (!existing) return { ok: false, reason: "not-found" };
+  //
+  // Decoded from the raw row rather than through `firstActual` alone because
+  // the optimistic guard below needs `updated_at`, which `CalendarActual`
+  // deliberately does not carry — it is a concurrency token, not part of the
+  // API surface.
+  const existingRow = readRs[0].rows[0] as unknown as DbCalendarActualJoined | undefined;
+  if (!existingRow) return { ok: false, reason: "not-found" };
+  const existing = rowToActual(existingRow);
   if (catIdx >= 0 && readRs[catIdx].rows.length === 0) {
     return { ok: false, reason: "invalid-category" };
   }
 
-  const checked = mergeAndValidateActual(id, existing, patch, firstActual(readRs[laneIdx]));
+  const checked = validateActualPatch(id, existing, patch, firstActual(readRs[laneIdx]));
   if (!checked.ok) return { ok: false, reason: checked.reason };
 
-  // Catch the partial UNIQUE violation as a fallback for the TOCTOU window
-  // between the read batch above and the UPDATE below. App-level pre-check
-  // gives a cleaner error in the uncontested case; the catch covers races.
-  // Batching the pre-checks narrowed that window, it did not remove it.
-  const stmts: Stmt[] = [updateActualStmt(id, checked.merged, Date.now())];
+  // Two independent guards on the same window between the read batch above and
+  // the UPDATE below. `expectUpdatedAt` is the general one: it refuses to apply
+  // a patch computed against a row that has since moved. The catch is the
+  // narrower one for the partial UNIQUE index, which the app-level pre-check
+  // reports more cleanly in the uncontested case but cannot enforce at all
+  // under contention. Batching the pre-checks narrowed the window; neither
+  // removes it.
+  const stmts: Stmt[] = [
+    updateActualStmt(id, patch, Date.now(), {
+      timezone: timezoneFromRead(readRs, tzIdx),
+      expectUpdatedAt: Number(existingRow.updated_at),
+    }),
+  ];
   const rowIdx = hydrate ? stmts.push({ sql: ACTUAL_BY_ID_SQL, args: [id] }) - 1 : -1;
   let writeRs;
   try {
@@ -1066,6 +1196,7 @@ export async function updateActual(
     }
     throw e;
   }
+  if ((writeRs[0].rowsAffected ?? 0) === 0) return { ok: false, reason: "conflict" };
   if (!hydrate) return { ok: true, actual: null };
   const updated = firstActual(writeRs[rowIdx]);
   if (!updated) throw new Error("Failed to load updated actual");
@@ -1124,9 +1255,12 @@ export type SegmentActualsResult =
  * than twice. If some other client has taken the lane in the meantime it gets
  * displaced, which is exactly what starting a lane has always meant.
  *
- * `opts.timezone` is only consulted by resuming segments (it anchors the new
- * row's `date`), so a pure close needs no site config read at all. Passing a
- * resuming segment without it is a programming error, not a runtime condition.
+ * `opts.timezone` anchors a new row's `date` on a resume, and re-derives the
+ * closed row's `date` when a patch moves its `startAt`. A pure close does
+ * neither, so it still needs no site config read at all. Passing a resuming
+ * segment without a timezone is a programming error, not a runtime condition; a
+ * patch that moves `startAt` without one is not, so that case fetches the zone
+ * itself rather than refusing the write or filing the row under the wrong day.
  */
 export async function segmentActuals(
   segments: LaneSegment[],
@@ -1166,8 +1300,15 @@ export async function segmentActuals(
     }
     return s;
   });
+  // One read for the whole call, not one per segment: every segment derives its
+  // `date` in the same zone.
+  const tzIdx = pushTimezoneRead(
+    reads,
+    !timezone && segments.some((seg) => seg.patch?.startAt !== undefined),
+  );
 
   const readRs = reads.length > 0 ? await batchStmts(reads, "read") : [];
+  const patchTimezone = timezone ?? timezoneFromRead(readRs, tzIdx);
 
   const writes: Stmt[] = [];
   let anyResume = false;
@@ -1181,14 +1322,19 @@ export async function segmentActuals(
       if (s.category >= 0 && readRs[s.category].rows.length === 0) {
         return { ok: false, index: i, phase: "close", reason: "invalid-category" };
       }
-      const checked = mergeAndValidateActual(
+      const checked = validateActualPatch(
         seg.id,
         existing,
         seg.patch,
         firstActual(readRs[s.lane]),
       );
       if (!checked.ok) return { ok: false, index: i, phase: "close", reason: checked.reason };
-      writes.push(updateActualStmt(seg.id, checked.merged, now));
+      // No `expectUpdatedAt` here, unlike `updateActual`. This UPDATE is the
+      // describe half of a describe-then-close pair inside one transaction; a
+      // conflict result would abort a stop the caller has every right to make,
+      // and there is no reason to report it through. Narrowing the SET list to
+      // the patched columns is what actually matters, and that is shared.
+      writes.push(updateActualStmt(seg.id, seg.patch, now, { timezone: patchTimezone }));
     }
 
     writes.push({ sql: STOP_ACTUAL_SQL, args: [now, now, seg.id] });

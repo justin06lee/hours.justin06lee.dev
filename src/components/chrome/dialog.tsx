@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useId, useRef, useState } from "react";
 
 type ConfirmOptions = {
   title: string;
@@ -49,42 +49,53 @@ function settleStranded(prev: DialogState) {
 
 export function DialogProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<DialogState>(null);
+  // The live entry mirrored outside React state. Settling a promise is an
+  // observable side effect, and React re-runs or discards setState updaters
+  // (StrictMode, an interrupted concurrent render) — so the stranded confirm
+  // is settled here, from the caller, where it happens exactly once.
+  const pendingRef = useRef<DialogState>(null);
+  const openDialog = useCallback((next: NonNullable<DialogState>) => {
+    settleStranded(pendingRef.current);
+    pendingRef.current = next;
+    setState(next);
+  }, []);
+  // A provider unmounting mid-dialog would otherwise leave the caller awaiting
+  // a promise nobody can resolve.
+  useEffect(
+    () => () => {
+      settleStranded(pendingRef.current);
+      pendingRef.current = null;
+    },
+    [],
+  );
   const confirm = useCallback(
     (options: ConfirmOptions) =>
       new Promise<boolean>((resolve) =>
-        setState((prev) => {
-          settleStranded(prev);
-          return { kind: "confirm", options, resolve };
-        }),
+        openDialog({ kind: "confirm", options, resolve }),
       ),
-    [],
+    [openDialog],
   );
   const alert = useCallback(
     (options: AlertOptions) =>
-      new Promise<void>((resolve) =>
-        setState((prev) => {
-          settleStranded(prev);
-          return { kind: "alert", options, resolve };
-        }),
-      ),
-    [],
+      new Promise<void>((resolve) => openDialog({ kind: "alert", options, resolve })),
+    [openDialog],
   );
   const panelRef = useRef<HTMLDivElement>(null);
   const confirmBtnRef = useRef<HTMLButtonElement>(null);
   const cancelBtnRef = useRef<HTMLButtonElement>(null);
   // Element focused before the dialog opened, restored on close.
   const previouslyFocused = useRef<HTMLElement | null>(null);
-  const close = useCallback(
-    (resolved: boolean) => {
-      if (!state) return;
-      if (state.kind === "confirm") state.resolve(resolved);
-      else state.resolve();
-      setState(null);
-    },
-    [state],
-  );
+  const close = useCallback((resolved: boolean) => {
+    const pending = pendingRef.current;
+    if (!pending) return;
+    pendingRef.current = null;
+    if (pending.kind === "confirm") pending.resolve(resolved);
+    else pending.resolve();
+    setState(null);
+  }, []);
 
   const isDanger = state?.kind === "confirm" && state.options.danger === true;
+  const titleId = useId();
 
   // Capture the previously focused element and move focus into the dialog.
   // Danger confirms default to Cancel so Enter can't instantly confirm a
@@ -158,22 +169,27 @@ export function DialogProvider({ children }: { children: React.ReactNode }) {
           <div
             className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 px-4"
             style={{ animation: "chrome-dialog-overlay 120ms ease-out" }}
-            onClick={() => close(false)}
+            // Dismiss on a press that starts on the backdrop itself. Closing on
+            // click instead let a drag that began inside the panel — selecting
+            // the message text — dismiss the dialog when the pointer came up
+            // out here. Escape (below) is the keyboard path.
+            onMouseDown={(e) => {
+              if (e.target === e.currentTarget) close(false);
+            }}
           >
             <div
               ref={panelRef}
               className="w-full max-w-sm border border-white/20 bg-black p-5 space-y-4"
               style={{ animation: "chrome-dialog-panel 150ms cubic-bezier(0.2, 0.8, 0.2, 1)" }}
-              onClick={(e) => e.stopPropagation()}
               role="dialog"
               aria-modal="true"
-              aria-labelledby="chrome-dialog-title"
+              aria-labelledby={titleId}
             >
             <div className="space-y-2">
               <div className="text-xs font-mono uppercase tracking-widest text-white/50">
                 {state.kind === "confirm" ? "Confirm" : "Notice"}
               </div>
-              <div id="chrome-dialog-title" className="text-sm text-white">{state.options.title}</div>
+              <div id={titleId} className="text-sm text-white">{state.options.title}</div>
               {state.options.message && (
                 <div className="text-xs text-white/60 whitespace-pre-line">{state.options.message}</div>
               )}

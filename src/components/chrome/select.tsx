@@ -81,20 +81,25 @@ export default function Select<T extends string | number>({
 
   const selected = options.find((o) => o.value === value) ?? null;
 
-  const move = (dir: 1 | -1) => {
+  // `from` lets Home/End restart the walk from "nothing highlighted" without
+  // queueing a separate -1 update the walk would have to read back.
+  const move = (dir: 1 | -1, from: number = activeIndex) => {
     if (options.length === 0) return;
-    setActiveIndex((i) => {
-      const start = i < 0 ? (dir === 1 ? -1 : 0) : i;
-      let next = start;
-      // Skip disabled options, wrapping around.
-      for (let step = 0; step < options.length; step++) {
-        next += dir;
-        if (next < 0) next = options.length - 1;
-        if (next > options.length - 1) next = 0;
-        if (!options[next]?.disabled) return next;
+    const start = from < 0 ? (dir === 1 ? -1 : 0) : from;
+    let next = start;
+    // Skip disabled options, wrapping around.
+    for (let step = 0; step < options.length; step++) {
+      next += dir;
+      if (next < 0) next = options.length - 1;
+      if (next > options.length - 1) next = 0;
+      if (!options[next]?.disabled) {
+        setActiveIndex(next);
+        // The listbox is a fixed-height scroller, so past the fold the highlight
+        // moves out of view and the list reads as frozen. Follow it.
+        document.getElementById(optionId(next))?.scrollIntoView({ block: "nearest" });
+        return;
       }
-      return i;
-    });
+    }
   };
 
   const selectAt = (i: number) => {
@@ -119,13 +124,11 @@ export default function Select<T extends string | number>({
         break;
       case "Home":
         e.preventDefault();
-        setActiveIndex(-1);
-        move(1);
+        move(1, -1);
         break;
       case "End":
         e.preventDefault();
-        setActiveIndex(-1);
-        move(-1);
+        move(-1, -1);
         break;
       case "Enter":
         if (activeIndex >= 0) {

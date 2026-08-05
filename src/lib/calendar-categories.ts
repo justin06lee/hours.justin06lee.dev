@@ -63,6 +63,23 @@ export async function findCategoryByNameCI(name: string): Promise<CalendarCatego
   return row ? rowToCategory(row) : null;
 }
 
+/** Detects a violation of `idx_calendar_categories_name_lower`. Same shape as
+ *  calendar.ts's running-row detector: the remote driver reports the extended
+ *  code as `code`, the local sqlite3 driver reports it as `extendedCode` and
+ *  puts the base `SQLITE_CONSTRAINT` in `code`, so the message check is what
+ *  covers the rest. The bare base code is deliberately NOT matched — a NOT NULL
+ *  failure is a bug, and reporting it as "duplicate" would hide it forever. */
+function isNameUniqueViolation(e: unknown): boolean {
+  if (!e || typeof e !== "object") return false;
+  const err = e as { code?: string; extendedCode?: string; message?: string };
+  if (err.code === "SQLITE_CONSTRAINT_UNIQUE" || err.extendedCode === "SQLITE_CONSTRAINT_UNIQUE") {
+    return true;
+  }
+  const msg = err.message ?? "";
+  return /UNIQUE constraint failed.*calendar_categories/i.test(msg) ||
+         msg.includes("idx_calendar_categories_name_lower");
+}
+
 export async function createCategory(input: NewCategory): Promise<{ ok: true; category: CalendarCategory } | { ok: false; reason: "duplicate" | "invalid-color" | "empty-name" }> {
   await initDb();
   if (!isPaletteColor(input.color)) return { ok: false, reason: "invalid-color" };
@@ -72,18 +89,27 @@ export async function createCategory(input: NewCategory): Promise<{ ok: true; ca
   if (dup) return { ok: false, reason: "duplicate" };
   const id = randomUUID();
   const now = Date.now();
-  // position is a small orderable integer (ORDER BY position ASC), not a
-  // timestamp — append after the current max so new categories sort last.
-  const posRes = await db.execute({
-    sql: "SELECT COALESCE(MAX(position), -1) + 1 AS next FROM calendar_categories",
-    args: [],
-  });
-  const position = Number((posRes.rows[0] as unknown as { next: number }).next ?? 0);
-  await db.execute({
-    sql: `INSERT INTO calendar_categories (id, name, color, is_system, archived, position, created_at, updated_at)
-          VALUES (?, ?, ?, 0, 0, ?, ?, ?)`,
-    args: [id, trimmed, input.color, position, now, now],
-  });
+  try {
+    // position is a small orderable integer (ORDER BY position ASC), not a
+    // timestamp — append after the current max so new categories sort last.
+    // Computed as a subquery rather than a preceding SELECT because two
+    // concurrent creates that both read the max would both write it, landing on
+    // the same position; inside the INSERT the read and the write are one
+    // statement and cannot interleave.
+    await db.execute({
+      sql: `INSERT INTO calendar_categories (id, name, color, is_system, archived, position, created_at, updated_at)
+            VALUES (?, ?, ?, 0, 0, (SELECT COALESCE(MAX(position), -1) + 1 FROM calendar_categories), ?, ?)`,
+      args: [id, trimmed, input.color, now, now],
+    });
+  } catch (e) {
+    // The duplicate check above is check-then-act against a live UNIQUE index,
+    // so a concurrent create can slip in between the two. Without this the
+    // loser raised a 500 instead of the `duplicate` this function is designed
+    // to return. The pre-check stays because it still gives the clean answer in
+    // the uncontested case; this only covers the race.
+    if (isNameUniqueViolation(e)) return { ok: false, reason: "duplicate" };
+    throw e;
+  }
   const created = await getCategoryById(id);
   if (!created) throw new Error("Failed to create category");
   return { ok: true, category: created };

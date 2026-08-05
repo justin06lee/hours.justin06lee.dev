@@ -4,9 +4,21 @@ import { SLEEP_CATEGORY_ID } from "./calendar-constants";
 
 export { SLEEP_CATEGORY_ID };
 
+/** A missing connection variable used to reach the driver as `undefined` and
+ *  surface as whatever opaque parse error it produced — at module evaluation,
+ *  so the stack pointed at `createClient` rather than at the deployment that
+ *  forgot to set the variable. Name it instead. */
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`${name} is not set; the app cannot reach its database.`);
+  }
+  return value;
+}
+
 export const db = createClient({
-  url: process.env.TURSO_DATABASE_URL!,
-  authToken: process.env.TURSO_AUTH_TOKEN!,
+  url: requireEnv("TURSO_DATABASE_URL"),
+  authToken: requireEnv("TURSO_AUTH_TOKEN"),
 });
 
 // ---------------------------------------------------------------------------
@@ -117,6 +129,11 @@ const SCHEMA_DDL: string[] = [
       FOREIGN KEY (category_id) REFERENCES calendar_categories(id) ON DELETE SET NULL
     )`,
   `CREATE INDEX IF NOT EXISTS idx_calendar_actuals_date ON calendar_actuals(date)`,
+  // categoryUsage() scans by category_id before every category delete, and the
+  // entry list orders the whole table by start_at on every homepage render.
+  // Both were full table scans.
+  `CREATE INDEX IF NOT EXISTS idx_calendar_actuals_category ON calendar_actuals(category_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_calendar_actuals_start_at ON calendar_actuals(start_at)`,
   // NOTE: the partial UNIQUE index guarding the running-row invariant lives in
   // POST_STEPS, not here, because it is built on `track` — a column older
   // installations only acquire via COLUMN_SPECS a step later.
@@ -166,11 +183,46 @@ const COLUMN_SPECS: ColumnSpec[] = [
 const DROP_LEGACY_RUNNING_INDEX = `DROP INDEX IF EXISTS idx_calendar_actuals_running`;
 
 const POST_STEPS: string[] = [
+  // Make the index below creatable. `CREATE UNIQUE INDEX` does not skip
+  // offending rows — it fails outright if the table already holds two open rows
+  // on one track, which a crashed migration or the sibling app can leave
+  // behind. That failure rejects initDb(), so EVERY page 500s on EVERY cold
+  // start with no recovery short of a code edit. Closing the duplicates first
+  // turns an unrecoverable state into a repaired one.
+  //
+  // The EXISTS names one strictly-newer open row on the SAME track under the
+  // total order (start_at, id), so per track exactly the maximum survives and
+  // every other open row on that track is closed. Consequences worth being
+  // explicit about, because this runs against a shared production database:
+  //   - a track whose only open row is that row matches nothing (the
+  //     comparison is strict and cannot find the row itself), so a legitimately
+  //     running lane is never touched;
+  //   - `=` rather than `IS` mirrors the index exactly, which treats NULLs as
+  //     distinct, so it closes precisely the rows the index would reject;
+  //   - re-running finds one open row per track and updates nothing, which is
+  //     also why the normal case — at most one open row per track — is a no-op;
+  //   - it only ever sets `end_at`; no row is deleted and no other column moves.
+  // MAX() rather than a bare `updated_at` because a row whose updated_at
+  // predates its start_at would otherwise be closed before it began, and a
+  // negative duration would corrupt every total that reads it.
+  `UPDATE calendar_actuals
+          SET end_at = MAX(start_at, updated_at)
+          WHERE end_at IS NULL
+            AND EXISTS (
+              SELECT 1 FROM calendar_actuals o
+               WHERE o.end_at IS NULL
+                 AND o.track = calendar_actuals.track
+                 AND (o.start_at > calendar_actuals.start_at
+                      OR (o.start_at = calendar_actuals.start_at
+                          AND o.id > calendar_actuals.id))
+            )`,
   // The running-row invariant is per-lane: at most one open row PER track
   // rather than one globally. This must run after the `calendar_actuals.track`
   // migration so the indexed column is guaranteed to exist — hence a separate
   // batch, issued after the ALTERs — and after DROP_LEGACY_RUNNING_INDEX,
-  // which the probe batch has already applied by this point.
+  // which the probe batch has already applied by this point. The repair above
+  // and this creation share a batch, so no writer can slip a second open row
+  // in between them.
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_actuals_running_track
           ON calendar_actuals(track) WHERE end_at IS NULL`,
   // One-time cleanup of pre-2026-05 fallback rows. The old shape was

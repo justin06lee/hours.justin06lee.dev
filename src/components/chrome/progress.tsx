@@ -52,13 +52,18 @@ export function Progress({
 }: ProgressProps) {
   const clamped = max > 0 ? Math.min(1, Math.max(0, value / max)) : 0;
   const percent = Math.round(clamped * 100);
-  const showHeader = label !== undefined || showValue;
+  const hasLabel = label !== undefined;
+  const showHeader = hasLabel || showValue;
+  const labelId = React.useId();
 
   return (
     <div className={cn("w-full", className)}>
       {showHeader && (
         <div className="mb-2 flex items-baseline justify-between gap-3">
-          <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-white/40">
+          <span
+            id={hasLabel ? labelId : undefined}
+            className="font-mono text-[11px] uppercase tracking-[0.18em] text-white/40"
+          >
             {label}
           </span>
           {showValue && (
@@ -70,7 +75,11 @@ export function Progress({
       )}
       <div
         role="progressbar"
-        aria-label={ariaLabel}
+        // A visible label names the bar directly; `ariaLabel` is only the
+        // fallback for the headerless case. Never both — aria-labelledby wins
+        // anyway, so setting both just hides the caller's string.
+        aria-labelledby={hasLabel ? labelId : undefined}
+        aria-label={hasLabel ? undefined : ariaLabel}
         aria-valuemin={indeterminate ? undefined : 0}
         aria-valuemax={indeterminate ? undefined : max}
         aria-valuenow={indeterminate ? undefined : value}

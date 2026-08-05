@@ -16,6 +16,9 @@ export function LoginForm() {
         name="password"
         type="password"
         placeholder="password"
+        // The placeholder is the only visible label and it disappears on the
+        // first keystroke, so the field needs a name that survives typing.
+        aria-label="password"
         autoComplete="current-password"
         autoFocus
         required

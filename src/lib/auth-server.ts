@@ -29,9 +29,3 @@ export const isAdminServer = cache(async (): Promise<boolean> => {
   if (!token) return false;
   return validateSession(token);
 });
-
-export async function requireAdminServer(): Promise<void> {
-  if (!(await isAdminServer())) {
-    throw new Error("Unauthorized.");
-  }
-}

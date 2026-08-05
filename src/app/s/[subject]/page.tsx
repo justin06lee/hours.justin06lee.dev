@@ -6,14 +6,7 @@ import { StatTile } from "@/components/chrome/stat-tile";
 import { Streak } from "@/components/chrome/streak";
 import { HoursBarList, HoursHeatmap } from "@/components/hours-charts";
 import { getHoursOverview } from "@/lib/hours";
-import {
-  computeStreak,
-  formatHours,
-  MS_PER_HOUR,
-  slugify,
-  splitByDay,
-  unionMs,
-} from "@/lib/hours-math";
+import { computeStreak, formatHours, MS_PER_HOUR, splitByDay, unionMs } from "@/lib/hours-math";
 import { todayInTz } from "@/lib/calendar-dates";
 import { EntryList } from "@/components/entry-list";
 import { SiteHeader } from "@/components/site-header";
@@ -27,7 +20,11 @@ export async function generateMetadata({
 }): Promise<Metadata> {
   const { subject } = await params;
   const overview = await getHoursOverview();
-  const match = overview.subjects.find((s) => s.id && slugify(s.name) === subject);
+  // Matching on the de-duplicated `slug` rather than re-slugifying the name is
+  // what makes this a bijection: two categories whose names slugify alike used
+  // to share one URL, and first-match-wins served the busier one's numbers
+  // under both names while the other page was unreachable.
+  const match = overview.subjects.find((s) => s.id && s.slug === subject);
   if (!match) return { title: "not found" };
   return {
     title: match.name.toLowerCase(),
@@ -46,7 +43,7 @@ export default async function SubjectPage({
 }) {
   const { subject: slug } = await params;
   const overview = await getHoursOverview();
-  const subject = overview.subjects.find((s) => s.id && slugify(s.name) === slug);
+  const subject = overview.subjects.find((s) => s.id && s.slug === slug);
   if (!subject) notFound();
 
   const entries = overview.entries.filter((e) => e.categoryId === subject.id);

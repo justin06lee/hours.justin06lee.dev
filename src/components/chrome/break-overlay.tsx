@@ -123,20 +123,34 @@ export function BreakOverlay({
   // from a clean slate rather than resuming a stale deadline.
   useEffect(() => {
     if (!open) {
+      // The deadline only exists once the overlay is up, so it cannot be part
+      // of the initial state — clearing it has to happen after the fact.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setDeadline(null);
       completedRef.current = false;
       return;
     }
+    // Re-arm on every new deadline, not just on close: a host can move the
+    // deadline while the overlay stays open (back-to-back breaks), and a flag
+    // left over from the previous one would swallow the next completion.
     if (endsAtMs !== undefined) {
       setDeadline(endsAtMs);
+      completedRef.current = false;
       return;
     }
-    if (seconds !== undefined) setDeadline(Date.now() + seconds * 1000);
+    if (seconds !== undefined) {
+      setDeadline(Date.now() + seconds * 1000);
+      completedRef.current = false;
+    }
   }, [open, endsAtMs, seconds]);
 
   // One second tick, alive only while the overlay is.
   useEffect(() => {
     if (!open) {
+      // Date.now() can only be read after mount — seeding the clock during
+      // render would bake the server's time into the HTML and mismatch at
+      // hydration — so both the reset and the seed below live in the effect.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setNow(null);
       return;
     }

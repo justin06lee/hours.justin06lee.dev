@@ -5,8 +5,10 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import {
   SESSION_COOKIE_NAME,
+  checkRateLimit,
   createSession,
   destroySession,
+  getClientIp,
   verifyAdminKey,
 } from "@/lib/auth";
 import { isAdminServer } from "@/lib/auth-server";
@@ -55,8 +57,31 @@ export type LoginState = { error: string | null };
 export async function login(_prev: LoginState, formData: FormData): Promise<LoginState> {
   const password = formData.get("password");
   if (typeof password !== "string" || password.length === 0) {
+    // Deliberately ahead of the rate limit: an empty field is a UI slip, not a
+    // guess, and it never reaches the compare, so it shouldn't burn an attempt.
     return { error: "enter the password" };
   }
+
+  // Brute-force gate. This action is the only login surface in the app — there
+  // is no middleware, no proxy, and no route handlers — so with nothing here an
+  // attacker scripts unlimited guesses against ADMIN_KEY at line speed with a
+  // clean success/failure oracle and no lockout or delay. The limit runs
+  // *before* verifyAdminKey so a locked-out caller learns nothing about whether
+  // the guess it just sent was right.
+  //
+  // A request whose IP can't be determined buckets to "unknown", and that
+  // shared counter is enforced like any other. Skipping the limit there would
+  // be a one-header bypass of the whole control. The cost of sharing is that
+  // ten failures from unattributable requests lock that bucket out, but this is
+  // a single-admin site: in production x-forwarded-for is always set, so
+  // "unknown" is only reached in local dev or with a misconfigured proxy, and
+  // the blast radius is one person waiting out a window rather than an open
+  // door. Fail closed, and prefer the mild failure to the trivial bypass.
+  const ip = await getClientIp();
+  if (!(await checkRateLimit(ip))) {
+    return { error: "too many attempts" };
+  }
+
   // Constant-time compare lives in verifyAdminKey.
   if (!verifyAdminKey(password)) {
     return { error: "wrong password" };
