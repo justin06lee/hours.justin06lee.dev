@@ -11,6 +11,11 @@ import { SiteHeader } from "@/components/site-header";
 // Every view is live: the whole point is the number moving while a timer runs.
 export const dynamic = "force-dynamic";
 
+// Declared per-page rather than inherited from the root layout. Layout
+// metadata is inherited shallowly, so a canonical set there would tell search
+// engines that every subject page is a duplicate of this one.
+export const metadata = { alternates: { canonical: "/" } };
+
 export default async function HomePage() {
   const overview = await getHoursOverview();
   const today = todayInTz(overview.timezone);

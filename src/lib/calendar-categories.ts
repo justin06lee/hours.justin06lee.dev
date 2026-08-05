@@ -27,13 +27,19 @@ export function rowToCategory(row: DbCalendarCategory): CalendarCategory {
   };
 }
 
+/**
+ * The canonical "every category, in UI order" query. Exported because
+ * hours.ts folds it into a single batched read alongside its own selects, and
+ * two copies of this SQL would eventually drift. The ORDER BY is load-bearing:
+ * live before archived, the system Sleep row first, then manual position, with
+ * a case-insensitive name as the stable tiebreak. Change it here or nowhere.
+ */
+export const CATEGORY_LIST_SQL = `SELECT * FROM calendar_categories
+          ORDER BY archived ASC, is_system DESC, position ASC, LOWER(name) ASC`;
+
 export async function listCategories(): Promise<CalendarCategory[]> {
   await initDb();
-  const result = await db.execute({
-    sql: `SELECT * FROM calendar_categories
-          ORDER BY archived ASC, is_system DESC, position ASC, LOWER(name) ASC`,
-    args: [],
-  });
+  const result = await db.execute({ sql: CATEGORY_LIST_SQL, args: [] });
   return (result.rows as unknown as DbCalendarCategory[]).map(rowToCategory);
 }
 

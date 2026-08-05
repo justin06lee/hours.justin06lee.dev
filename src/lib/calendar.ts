@@ -118,22 +118,36 @@ function serializeFallbacks(fbs: PlanFallback[] | undefined | null): string | nu
   return JSON.stringify(normalized);
 }
 
+/**
+ * A statement in the shape `db.batch` wants, but with `args` typed loosely so
+ * the builders below can assemble lists generically. libsql declares `args` as
+ * its own `InValue` union; every value we put in one is a string, number or
+ * null, so the cast in {@link batchStmts} is the same one the pre-existing
+ * batch call sites already used.
+ */
+type Stmt = { sql: string; args: unknown[] };
+
+function batchStmts(stmts: Stmt[], mode: "read" | "write") {
+  return db.batch(stmts as never, mode);
+}
+
+const CATEGORY_EXISTS_SQL = "SELECT 1 FROM calendar_categories WHERE id = ? LIMIT 1";
+const PLAN_EXISTS_SQL = "SELECT 1 FROM calendar_tasks WHERE id = ? LIMIT 1";
+
 /** Returns true iff the given non-null id matches a row. We use this from
  *  write paths so callers see a clear "invalid-category"/"invalid-plan"
- *  error instead of silently storing a dangling FK. */
+ *  error instead of silently storing a dangling FK.
+ *
+ *  The SQL is shared with the batched pre-check paths (see
+ *  {@link pushStartReads}) so the two can never disagree about what "exists"
+ *  means. */
 async function categoryExists(id: string): Promise<boolean> {
-  const r = await db.execute({
-    sql: "SELECT 1 FROM calendar_categories WHERE id = ? LIMIT 1",
-    args: [id],
-  });
+  const r = await db.execute({ sql: CATEGORY_EXISTS_SQL, args: [id] });
   return r.rows.length > 0;
 }
 
 async function planExists(id: string): Promise<boolean> {
-  const r = await db.execute({
-    sql: "SELECT 1 FROM calendar_tasks WHERE id = ? LIMIT 1",
-    args: [id],
-  });
+  const r = await db.execute({ sql: PLAN_EXISTS_SQL, args: [id] });
   return r.rows.length > 0;
 }
 
@@ -345,6 +359,84 @@ function rowToActual(row: DbCalendarActualJoined): CalendarActual {
   };
 }
 
+/**
+ * The one SELECT/FROM/JOIN prefix every actual-reading query is built on, so
+ * the join shape `rowToActual` depends on can only drift in one place.
+ *
+ * It lives at module scope rather than inside the helpers that used to own it
+ * because `db.batch` takes SQL strings: folding a read-back or a
+ * "what's running now?" lookup into the same transaction as the write means
+ * the SQL has to be reachable from the batch builder, not locked inside an
+ * `await`-per-call helper.
+ */
+const ACTUAL_SELECT = `SELECT a.*, c.id AS cat_id, c.name AS cat_name, c.color AS cat_color, p.title AS plan_title
+          FROM calendar_actuals a
+          LEFT JOIN calendar_categories c ON c.id = a.category_id
+          LEFT JOIN calendar_tasks p ON p.id = a.plan_id`;
+
+const ACTUAL_BY_ID_SQL = `${ACTUAL_SELECT}
+          WHERE a.id = ?`;
+
+const RUNNING_LANES_SQL = `${ACTUAL_SELECT}
+          WHERE a.end_at IS NULL
+          ORDER BY a.track ASC`;
+
+const RUNNING_ON_TRACK_SQL = `${ACTUAL_SELECT}
+          WHERE a.end_at IS NULL AND a.track = ?
+          LIMIT 1`;
+
+/**
+ * "Who holds this lane right now?", addressed by the id of a row that sits on
+ * it rather than by lane number. The correlated subquery exists so this can
+ * ride in the SAME read batch as the fetch of that row — otherwise the lookup
+ * would have to wait a whole round trip for `existing.track` to come back.
+ *
+ * COALESCE mirrors `rowToActual`'s `track ?? 0`: a pre-migration row with a
+ * NULL track reads as lane 0 in JS, so it has to resolve to lane 0 here too.
+ * The outer comparison is deliberately NOT coalesced — `getRunningActualOnTrack`
+ * doesn't coalesce either, and matching its behaviour exactly is the point.
+ */
+const RUNNING_ON_LANE_OF_SQL = `${ACTUAL_SELECT}
+          WHERE a.end_at IS NULL
+            AND a.track = (SELECT COALESCE(track, 0) FROM calendar_actuals WHERE id = ?)
+          LIMIT 1`;
+
+/** Just the id of whatever holds a lane — all a stop statement needs. */
+const RUNNING_ID_ON_TRACK_SQL =
+  "SELECT id FROM calendar_actuals WHERE end_at IS NULL AND track = ? LIMIT 1";
+
+/** The `end_at IS NULL` guard is what makes a stop idempotent and race-safe:
+ *  rowsAffected === 0 means somebody else closed the row first. */
+const STOP_ACTUAL_SQL =
+  "UPDATE calendar_actuals SET end_at=?, updated_at=? WHERE id=? AND end_at IS NULL";
+
+const STOP_ALL_ACTUALS_SQL =
+  "UPDATE calendar_actuals SET end_at=?, updated_at=? WHERE end_at IS NULL";
+
+const INSERT_ACTUAL_SQL = `INSERT INTO calendar_actuals
+          (id, date, plan_id, category_id, title, start_at, end_at, track, notes, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+const UPDATE_ACTUAL_SQL = `UPDATE calendar_actuals
+            SET category_id=?, title=?, start_at=?, end_at=?, notes=?, updated_at=?
+            WHERE id=?`;
+
+/** Only the two fields a start inherits from its plan. Doubles as the
+ *  existence check, so "does this plan exist?" and "what does it say?" cost
+ *  one statement between them instead of two. */
+const PLAN_FIELDS_SQL = "SELECT category_id, title FROM calendar_tasks WHERE id = ? LIMIT 1";
+
+/** libsql hands back `Row[]`; every actual query selects the same columns, so
+ *  the decode is always these two lines. */
+function toActuals(rs: { rows: unknown[] }): CalendarActual[] {
+  return (rs.rows as unknown as DbCalendarActualJoined[]).map(rowToActual);
+}
+
+function firstActual(rs: { rows: unknown[] }): CalendarActual | null {
+  const row = rs.rows[0] as DbCalendarActualJoined | undefined;
+  return row ? rowToActual(row) : null;
+}
+
 export async function getActualsInRange(from: string, to: string): Promise<CalendarActual[]> {
   await initDb();
   // Returns rows anchored to [from, to] plus any currently-running row.
@@ -355,16 +447,13 @@ export async function getActualsInRange(from: string, to: string): Promise<Calen
     // Include the running row only if it could plausibly intersect the range
     // (its anchor date is on or before `to`). Without that bound, historical
     // queries would always pick up "now" — surprising for callers.
-    sql: `SELECT a.*, c.id AS cat_id, c.name AS cat_name, c.color AS cat_color, p.title AS plan_title
-          FROM calendar_actuals a
-          LEFT JOIN calendar_categories c ON c.id = a.category_id
-          LEFT JOIN calendar_tasks p ON p.id = a.plan_id
+    sql: `${ACTUAL_SELECT}
           WHERE (a.date BETWEEN ? AND ?)
              OR (a.end_at IS NULL AND a.date <= ?)
           ORDER BY a.start_at ASC`,
     args: [from, to, to],
   });
-  return (result.rows as unknown as DbCalendarActualJoined[]).map(rowToActual);
+  return toActuals(result);
 }
 
 /**
@@ -380,17 +469,13 @@ export async function getRunningActual(): Promise<CalendarActual | null> {
   // Lowest track wins, then newest, so the answer is stable when several
   // lanes run at once.
   const result = await db.execute({
-    sql: `SELECT a.*, c.id AS cat_id, c.name AS cat_name, c.color AS cat_color, p.title AS plan_title
-          FROM calendar_actuals a
-          LEFT JOIN calendar_categories c ON c.id = a.category_id
-          LEFT JOIN calendar_tasks p ON p.id = a.plan_id
+    sql: `${ACTUAL_SELECT}
           WHERE a.end_at IS NULL
           ORDER BY a.track ASC, a.start_at DESC
           LIMIT 1`,
     args: [],
   });
-  const row = result.rows[0] as unknown as DbCalendarActualJoined | undefined;
-  return row ? rowToActual(row) : null;
+  return firstActual(result);
 }
 
 /**
@@ -399,16 +484,8 @@ export async function getRunningActual(): Promise<CalendarActual | null> {
  */
 export async function getRunningActuals(): Promise<CalendarActual[]> {
   await initDb();
-  const result = await db.execute({
-    sql: `SELECT a.*, c.id AS cat_id, c.name AS cat_name, c.color AS cat_color, p.title AS plan_title
-          FROM calendar_actuals a
-          LEFT JOIN calendar_categories c ON c.id = a.category_id
-          LEFT JOIN calendar_tasks p ON p.id = a.plan_id
-          WHERE a.end_at IS NULL
-          ORDER BY a.track ASC`,
-    args: [],
-  });
-  return (result.rows as unknown as DbCalendarActualJoined[]).map(rowToActual);
+  const result = await db.execute({ sql: RUNNING_LANES_SQL, args: [] });
+  return toActuals(result);
 }
 
 /** The running actual occupying a specific lane, if any. */
@@ -416,31 +493,14 @@ export async function getRunningActualOnTrack(
   track: number,
 ): Promise<CalendarActual | null> {
   await initDb();
-  const result = await db.execute({
-    sql: `SELECT a.*, c.id AS cat_id, c.name AS cat_name, c.color AS cat_color, p.title AS plan_title
-          FROM calendar_actuals a
-          LEFT JOIN calendar_categories c ON c.id = a.category_id
-          LEFT JOIN calendar_tasks p ON p.id = a.plan_id
-          WHERE a.end_at IS NULL AND a.track = ?
-          LIMIT 1`,
-    args: [track],
-  });
-  const row = result.rows[0] as unknown as DbCalendarActualJoined | undefined;
-  return row ? rowToActual(row) : null;
+  const result = await db.execute({ sql: RUNNING_ON_TRACK_SQL, args: [track] });
+  return firstActual(result);
 }
 
 async function getActualById(id: string): Promise<CalendarActual | null> {
   await initDb();
-  const result = await db.execute({
-    sql: `SELECT a.*, c.id AS cat_id, c.name AS cat_name, c.color AS cat_color, p.title AS plan_title
-          FROM calendar_actuals a
-          LEFT JOIN calendar_categories c ON c.id = a.category_id
-          LEFT JOIN calendar_tasks p ON p.id = a.plan_id
-          WHERE a.id = ?`,
-    args: [id],
-  });
-  const row = result.rows[0] as unknown as DbCalendarActualJoined | undefined;
-  return row ? rowToActual(row) : null;
+  const result = await db.execute({ sql: ACTUAL_BY_ID_SQL, args: [id] });
+  return firstActual(result);
 }
 
 export type StartActualInput = {
@@ -457,9 +517,56 @@ export type StartActualInput = {
   track?: number;
 };
 
+/**
+ * Opt-out for the read-back that turns a freshly written row into a full
+ * {@link CalendarActual}.
+ *
+ * Defaults to `true`, so every caller written before this existed keeps the
+ * rich result it was written against. Server Actions that only ever ask "what
+ * is running now?" pass `false`: the read-back statements are dropped from the
+ * write batch entirely. That costs no extra round trip either way — the
+ * read-back rides in the same transaction as the write — but it does drop two
+ * joins and a row's worth of wire traffic per call, and it lets the result
+ * type say plainly that nothing was read.
+ */
+export type HydrateOptions = {
+  hydrate?: boolean;
+};
+
+/**
+ * Every lane still running once the write has committed. Present on the
+ * mutation results because the SELECT that produces it is the last statement
+ * of the same `db.batch` — a trailing read in a `"write"` batch observes the
+ * writes ahead of it, so the caller gets post-mutation truth without a second
+ * round trip.
+ */
 export type StartActualResult =
-  | { ok: true; started: CalendarActual; autoStopped: CalendarActual | null }
+  | { ok: true; started: CalendarActual; autoStopped: CalendarActual | null; lanes: CalendarActual[] }
   | { ok: false; reason: "concurrent-start" | "invalid-category" | "invalid-plan" };
+
+/**
+ * {@link startActual}'s result under `hydrate: false`. The rows were written;
+ * they just were not read back, and the type says so rather than handing back
+ * a cast-shaped lie.
+ */
+export type StartActualResultLean =
+  | { ok: true; started: null; autoStopped: null; lanes: CalendarActual[] }
+  | { ok: false; reason: "concurrent-start" | "invalid-category" | "invalid-plan" };
+
+/**
+ * Result of starting several lanes in one transaction.
+ *
+ * `index` points at the offending input when the failure came from a
+ * per-input pre-check. It is null only when a constraint race trips the shared
+ * transaction and the error gives no way to say which insert did it.
+ */
+export type StartActualsResult =
+  | { ok: true; lanes: CalendarActual[] }
+  | {
+      ok: false;
+      index: number | null;
+      reason: "concurrent-start" | "invalid-category" | "invalid-plan";
+    };
 
 /** Detect a violation of the partial UNIQUE index guarding one running row
  *  per track. libsql surfaces the SQLITE_CONSTRAINT_UNIQUE code on its error
@@ -476,17 +583,60 @@ function isRunningUniqueViolation(e: unknown): boolean {
          msg.includes("idx_calendar_actuals_running");
 }
 
-export async function startActual(input: StartActualInput): Promise<StartActualResult> {
-  await initDb();
-  const now = input.nowMs ?? Date.now();
+/** Where one input's pre-check reads landed in the shared read batch. -1 means
+ *  the check was skipped because the input didn't ask for it. */
+type StartReadSlots = { category: number; plan: number; running: number };
 
-  // Validate explicit refs up front. `getTaskById` below also confirms plan
-  // existence, but we need a clean error before that path can null-it-out.
-  if (input.categoryId && !(await categoryExists(input.categoryId))) {
-    return { ok: false, reason: "invalid-category" };
+/**
+ * Appends one start's pre-checks to a read batch under construction. Nothing
+ * here depends on another statement's *result*, which is exactly why they can
+ * all travel together: category existence, plan existence-and-fields, and
+ * "who currently holds this lane?" are three independent questions.
+ *
+ * The plan lookup deliberately fetches the two fields a start inherits rather
+ * than calling `planExists` and then `getTaskById` — one statement answers
+ * both, and the old pair could only ever disagree by racing each other.
+ */
+function pushStartReads(reads: Stmt[], input: StartActualInput): StartReadSlots {
+  const slots: StartReadSlots = { category: -1, plan: -1, running: -1 };
+  if (input.categoryId) {
+    slots.category = reads.push({ sql: CATEGORY_EXISTS_SQL, args: [input.categoryId] }) - 1;
   }
-  if (input.planId && !(await planExists(input.planId))) {
-    return { ok: false, reason: "invalid-plan" };
+  if (input.planId) {
+    slots.plan = reads.push({ sql: PLAN_FIELDS_SQL, args: [input.planId] }) - 1;
+  }
+  slots.running = reads.push({ sql: RUNNING_ID_ON_TRACK_SQL, args: [input.track ?? 0] }) - 1;
+  return slots;
+}
+
+/** The write half of a start, held apart from the read half so callers can
+ *  decide the surrounding transaction. `displacedId` is the snapshot of who
+ *  held the lane at pre-check time; the caller emits `stop` unless it is
+ *  already closing that row for another reason. */
+type PreparedStart = {
+  id: string;
+  displacedId: string | null;
+  stop: Stmt | null;
+  insert: Stmt;
+};
+
+/**
+ * Turns one input plus its pre-check rows into the statements that start it.
+ *
+ * The lane snapshot taken in `pushStartReads` is advisory only: between the
+ * read batch and the write batch another client can take the lane. That is
+ * what the partial UNIQUE index is for, and why every caller of this still
+ * wraps its batch in the `isRunningUniqueViolation` catch. Batching narrows
+ * the TOCTOU window; it does not close it.
+ */
+function consumeStartReads(
+  results: { rows: unknown[] }[],
+  slots: StartReadSlots,
+  input: StartActualInput,
+  fallbackNowMs: number,
+): { ok: true; prepared: PreparedStart } | { ok: false; reason: "invalid-category" | "invalid-plan" } {
+  if (slots.category >= 0 && results[slots.category].rows.length === 0) {
+    return { ok: false, reason: "invalid-category" };
   }
 
   // Hydrate from plan if requested. We distinguish "not provided" (undefined)
@@ -494,40 +644,95 @@ export async function startActual(input: StartActualInput): Promise<StartActualR
   // by sending null.
   let categoryId: string | null = input.categoryId !== undefined ? input.categoryId : null;
   let title: string | null = input.title !== undefined ? input.title : null;
-  if (input.planId) {
-    const plan = await getTaskById(input.planId);
-    if (plan) {
-      if (input.categoryId === undefined) categoryId = plan.categoryId;
-      if (input.title === undefined) title = plan.title;
-    }
+  if (slots.plan >= 0) {
+    const plan = results[slots.plan].rows[0] as
+      | { category_id: string | null; title: string | null }
+      | undefined;
+    if (!plan) return { ok: false, reason: "invalid-plan" };
+    if (input.categoryId === undefined) categoryId = plan.category_id;
+    if (input.title === undefined) title = plan.title;
   }
 
-  // Snapshot the row running ON THIS LANE, then atomically stop+insert in one
-  // transaction. Other lanes are deliberately untouched — that is the whole
-  // point of tracks. The partial UNIQUE index on (track) WHERE end_at IS NULL
-  // catches concurrent starts on the same lane that race past the snapshot,
-  // surfaced as `concurrent-start`.
+  const now = input.nowMs ?? fallbackNowMs;
   const track = input.track ?? 0;
-  const running = await getRunningActualOnTrack(track);
+  const displaced = results[slots.running].rows[0] as { id: string } | undefined;
+  const displacedId = displaced?.id ?? null;
   const id = randomUUID();
   const date = epochToDateInTz(now, input.timezone);
 
-  const ops: { sql: string; args: unknown[] }[] = [];
-  if (running) {
-    ops.push({
-      sql: `UPDATE calendar_actuals SET end_at=?, updated_at=? WHERE id=? AND end_at IS NULL`,
-      args: [now, now, running.id],
-    });
-  }
-  ops.push({
-    sql: `INSERT INTO calendar_actuals
-          (id, date, plan_id, category_id, title, start_at, end_at, track, notes, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)`,
-    args: [id, date, input.planId ?? null, categoryId, title, now, track, now, now],
-  });
+  return {
+    ok: true,
+    prepared: {
+      id,
+      displacedId,
+      stop: displacedId
+        ? { sql: STOP_ACTUAL_SQL, args: [now, now, displacedId] }
+        : null,
+      insert: {
+        sql: INSERT_ACTUAL_SQL,
+        args: [id, date, input.planId ?? null, categoryId, title, now, null, track, null, now, now],
+      },
+    },
+  };
+}
 
+/**
+ * Starts one lane. Only ever displaces what was already running on THAT lane —
+ * other lanes are deliberately untouched, which is the whole point of tracks.
+ *
+ * Two round trips, always:
+ *
+ *   1. one `"read"` batch holding every independent pre-check (does the
+ *      category exist, does the plan exist and what does it say, who holds
+ *      this lane);
+ *   2. one `"write"` batch that stops the displaced row, inserts the new one,
+ *      optionally reads both back, and finishes with the running-lanes SELECT.
+ *      A trailing read in a `"write"` batch sees the writes ahead of it, so
+ *      `lanes` is post-mutation truth from inside the same transaction.
+ *
+ * The partial UNIQUE index on (track) WHERE end_at IS NULL catches concurrent
+ * starts on the same lane that race past step 1's snapshot, surfaced as
+ * `concurrent-start`. Batching shrinks that window; the catch is still what
+ * closes it.
+ */
+export async function startActual(
+  input: StartActualInput,
+  opts?: { hydrate?: true },
+): Promise<StartActualResult>;
+export async function startActual(
+  input: StartActualInput,
+  opts: { hydrate: false },
+): Promise<StartActualResultLean>;
+export async function startActual(
+  input: StartActualInput,
+  opts?: HydrateOptions,
+): Promise<StartActualResult | StartActualResultLean> {
+  await initDb();
+  const hydrate = opts?.hydrate !== false;
+
+  const reads: Stmt[] = [];
+  const slots = pushStartReads(reads, input);
+  const readRs = await batchStmts(reads, "read");
+
+  const step = consumeStartReads(readRs, slots, input, Date.now());
+  if (!step.ok) return { ok: false, reason: step.reason };
+  const { prepared } = step;
+
+  const stmts: Stmt[] = [];
+  if (prepared.stop) stmts.push(prepared.stop);
+  stmts.push(prepared.insert);
+  const startedIdx = hydrate
+    ? stmts.push({ sql: ACTUAL_BY_ID_SQL, args: [prepared.id] }) - 1
+    : -1;
+  const stoppedIdx =
+    hydrate && prepared.displacedId
+      ? stmts.push({ sql: ACTUAL_BY_ID_SQL, args: [prepared.displacedId] }) - 1
+      : -1;
+  const lanesIdx = stmts.push({ sql: RUNNING_LANES_SQL, args: [] }) - 1;
+
+  let writeRs;
   try {
-    await db.batch(ops as never, "write");
+    writeRs = await batchStmts(stmts, "write");
   } catch (e) {
     if (isRunningUniqueViolation(e)) {
       return { ok: false, reason: "concurrent-start" };
@@ -535,14 +740,76 @@ export async function startActual(input: StartActualInput): Promise<StartActualR
     throw e;
   }
 
-  const started = await getActualById(id);
+  const lanes = toActuals(writeRs[lanesIdx]);
+  if (!hydrate) return { ok: true, started: null, autoStopped: null, lanes };
+
+  const started = firstActual(writeRs[startedIdx]);
   if (!started) throw new Error("Failed to start actual");
-  const autoStopped = running ? await getActualById(running.id) : null;
-  return { ok: true, started, autoStopped };
+  const autoStopped = stoppedIdx >= 0 ? firstActual(writeRs[stoppedIdx]) : null;
+  return { ok: true, started, autoStopped, lanes };
+}
+
+/**
+ * Starts several lanes as one transaction: one read batch for every lane's
+ * pre-checks, one write batch for every stop+insert plus the trailing
+ * running-lanes SELECT. Two round trips for N lanes rather than 2N.
+ *
+ * All-or-nothing, which is stricter than starting them one at a time: if any
+ * insert trips the running-row index the whole transaction rolls back and no
+ * lane starts. That is the right trade for the caller this exists for
+ * (resuming every lane after a break) — a half-resumed session is worse than a
+ * failed one the user can retry.
+ *
+ * Never hydrates the written rows; `lanes` is the answer callers actually want.
+ */
+export async function startActuals(inputs: StartActualInput[]): Promise<StartActualsResult> {
+  await initDb();
+  if (inputs.length === 0) return { ok: true, lanes: await getRunningActuals() };
+
+  const reads: Stmt[] = [];
+  const slots = inputs.map((input) => pushStartReads(reads, input));
+  const readRs = await batchStmts(reads, "read");
+
+  const now = Date.now();
+  const writes: Stmt[] = [];
+  for (let i = 0; i < inputs.length; i++) {
+    const step = consumeStartReads(readRs, slots[i], inputs[i], now);
+    if (!step.ok) return { ok: false, index: i, reason: step.reason };
+    if (step.prepared.stop) writes.push(step.prepared.stop);
+    writes.push(step.prepared.insert);
+  }
+  const lanesIdx = writes.push({ sql: RUNNING_LANES_SQL, args: [] }) - 1;
+
+  try {
+    const writeRs = await batchStmts(writes, "write");
+    return { ok: true, lanes: toActuals(writeRs[lanesIdx]) };
+  } catch (e) {
+    if (isRunningUniqueViolation(e)) {
+      // libsql surfaces the constraint, not the statement that tripped it, so
+      // a multi-lane batch can't attribute the race to one input. With a
+      // single input there is nothing to attribute it to but input 0.
+      return { ok: false, index: inputs.length === 1 ? 0 : null, reason: "concurrent-start" };
+    }
+    throw e;
+  }
 }
 
 export type StopActualResult = {
   stopped: CalendarActual | null; // null if nothing was running (idempotent)
+  /** True when this call is the one that closed the row. False means the
+   *  `end_at IS NULL` guard matched nothing — somebody else got there first,
+   *  which is a successful no-op, not an error. */
+  closed: boolean;
+  /** Lanes still running afterwards, read in the same transaction as the stop. */
+  lanes: CalendarActual[];
+};
+
+/** {@link stopActualById}'s result under `hydrate: false`: the row was closed,
+ *  it just wasn't read back. `closed` still carries the race outcome. */
+export type StopActualResultLean = {
+  stopped: null;
+  closed: boolean;
+  lanes: CalendarActual[];
 };
 
 /**
@@ -563,47 +830,105 @@ export async function stopActual(
     track === undefined
       ? await getRunningActual()
       : await getRunningActualOnTrack(track);
-  if (!running) return { stopped: null };
+  if (!running) return { stopped: null, closed: false, lanes: await getRunningActuals() };
   return stopActualById(running.id, nowMs);
 }
 
 /**
  * Stops a specific actual by id. This is the lane-safe entry point for UIs
  * that address running rows directly rather than by lane number.
+ *
+ * One round trip: the UPDATE, an optional read-back of the row, and the
+ * running-lanes SELECT all travel as a single `"write"` batch. The trailing
+ * SELECT observes the UPDATE ahead of it, so `lanes` reflects the stop.
  */
 export async function stopActualById(
   id: string,
+  nowMs?: number,
+  opts?: { hydrate?: true },
+): Promise<StopActualResult>;
+export async function stopActualById(
+  id: string,
+  nowMs: number | undefined,
+  opts: { hydrate: false },
+): Promise<StopActualResultLean>;
+export async function stopActualById(
+  id: string,
   nowMs: number = Date.now(),
-): Promise<StopActualResult> {
+  opts?: HydrateOptions,
+): Promise<StopActualResult | StopActualResultLean> {
   await initDb();
+  const hydrate = opts?.hydrate !== false;
   // `WHERE end_at IS NULL` makes this a no-op if a concurrent stop already
   // closed the row; rowsAffected===0 means we lost the race and the row was
   // already stopped by someone else. Either way we return the current state.
-  const result = await db.execute({
-    sql: `UPDATE calendar_actuals SET end_at=?, updated_at=? WHERE id=? AND end_at IS NULL`,
-    args: [nowMs, nowMs, id],
-  });
-  if ((result.rowsAffected ?? 0) === 0) return { stopped: null };
-  const stopped = await getActualById(id);
-  return { stopped };
+  const stmts: Stmt[] = [{ sql: STOP_ACTUAL_SQL, args: [nowMs, nowMs, id] }];
+  const rowIdx = hydrate ? stmts.push({ sql: ACTUAL_BY_ID_SQL, args: [id] }) - 1 : -1;
+  const lanesIdx = stmts.push({ sql: RUNNING_LANES_SQL, args: [] }) - 1;
+
+  const rs = await batchStmts(stmts, "write");
+  const closed = (rs[0].rowsAffected ?? 0) > 0;
+  const lanes = toActuals(rs[lanesIdx]);
+  if (!hydrate) return { stopped: null, closed, lanes };
+  // `stopped` stays null when we lost the race, exactly as before: the caller
+  // asked what THIS call closed, and the answer is nothing.
+  return { stopped: closed ? firstActual(rs[rowIdx]) : null, closed, lanes };
 }
 
 /**
  * Stops every running lane at once — the "I'm done for now" action, and the
  * correct way to end a parallel session without leaving orphan lanes ticking.
+ *
+ * `lanes` is hard-coded to `[]` rather than read back, and that is exact
+ * rather than optimistic: the UPDATE's own predicate is `end_at IS NULL`, so
+ * once it commits there is provably no open row left. A trailing SELECT in the
+ * same transaction could only ever return the empty set, and a SELECT issued
+ * afterwards would be answering a different question ("has anyone started a
+ * lane since?") that the pre-batch version never asked either. So the read is
+ * not merely cheap to skip, it carries no information.
+ *
+ * `stopped` is a different matter — naming the rows this call closed requires
+ * knowing which rows were open, so `hydrate: true` still pays for a snapshot
+ * read first. Pass `hydrate: false` (one round trip, one statement) when the
+ * caller only needs the lanes cleared.
  */
 export async function stopAllActuals(
+  nowMs?: number,
+  opts?: { hydrate?: true },
+): Promise<{ stopped: CalendarActual[]; lanes: CalendarActual[] }>;
+export async function stopAllActuals(
+  nowMs: number | undefined,
+  opts: { hydrate: false },
+): Promise<{ stopped: never[]; lanes: never[] }>;
+export async function stopAllActuals(
   nowMs: number = Date.now(),
-): Promise<{ stopped: CalendarActual[] }> {
+  opts?: HydrateOptions,
+): Promise<{ stopped: CalendarActual[]; lanes: CalendarActual[] }> {
   await initDb();
+  if (opts?.hydrate === false) {
+    await db.execute({ sql: STOP_ALL_ACTUALS_SQL, args: [nowMs, nowMs] });
+    return { stopped: [], lanes: [] };
+  }
+
   const running = await getRunningActuals();
-  if (running.length === 0) return { stopped: [] };
-  await db.execute({
-    sql: `UPDATE calendar_actuals SET end_at=?, updated_at=? WHERE end_at IS NULL`,
-    args: [nowMs, nowMs],
-  });
-  const stopped = await Promise.all(running.map((r) => getActualById(r.id)));
-  return { stopped: stopped.filter((a): a is CalendarActual => a !== null) };
+  if (running.length === 0) return { stopped: [], lanes: [] };
+  // Read the closed rows back inside the same transaction as the UPDATE, by
+  // the ids we just snapshotted — one statement for all N instead of the N
+  // parallel point reads this used to fan out.
+  const placeholders = running.map(() => "?").join(", ");
+  const rs = await batchStmts(
+    [
+      { sql: STOP_ALL_ACTUALS_SQL, args: [nowMs, nowMs] },
+      {
+        sql: `${ACTUAL_SELECT}
+          WHERE a.id IN (${placeholders})
+          ORDER BY a.track ASC`,
+        args: running.map((r) => r.id),
+      },
+    ],
+    "write",
+  );
+  return { stopped: toActuals(rs[1]), lanes: [] };
 }
 
 export type ActualPatch = Partial<{
@@ -618,15 +943,33 @@ export type UpdateActualResult =
   | { ok: true; actual: CalendarActual }
   | { ok: false; reason: "not-found" | "start-after-end" | "would-overlap-running" | "invalid-category" };
 
-export async function updateActual(id: string, patch: ActualPatch): Promise<UpdateActualResult> {
-  await initDb();
-  const existing = await getActualById(id);
-  if (!existing) return { ok: false, reason: "not-found" };
-  if (patch.categoryId && !(await categoryExists(patch.categoryId))) {
-    return { ok: false, reason: "invalid-category" };
-  }
+/** {@link updateActual}'s result under `hydrate: false` — written, not read back. */
+export type UpdateActualResultLean =
+  | { ok: true; actual: null }
+  | { ok: false; reason: "not-found" | "start-after-end" | "would-overlap-running" | "invalid-category" };
 
-  const merged = {
+type MergedActual = {
+  categoryId: string | null;
+  title: string | null;
+  startAt: number;
+  endAt: number | null;
+  notes: string | null;
+};
+
+/**
+ * Pure merge + invariant check, split out so `updateActual` and the fused
+ * describe-then-close path in {@link segmentActuals} apply byte-identical
+ * rules and return byte-identical reasons.
+ *
+ * `running` is whoever holds this row's lane, already fetched by the caller.
+ */
+function mergeAndValidateActual(
+  id: string,
+  existing: CalendarActual,
+  patch: ActualPatch,
+  running: CalendarActual | null,
+): { ok: true; merged: MergedActual } | { ok: false; reason: "start-after-end" | "would-overlap-running" } {
+  const merged: MergedActual = {
     categoryId: patch.categoryId !== undefined ? patch.categoryId : existing.categoryId,
     title: patch.title !== undefined ? patch.title : existing.title,
     startAt: patch.startAt !== undefined ? patch.startAt : existing.startAt,
@@ -642,7 +985,6 @@ export async function updateActual(id: string, patch: ActualPatch): Promise<Upda
   // running row on a DIFFERENT track is the entire point of parallel tracks
   // (coding while a workout is timed), so only same-lane collisions are
   // rejected here.
-  const running = await getRunningActualOnTrack(existing.track);
   if (merged.endAt === null) {
     // Becoming/staying running: no OTHER row may hold this lane.
     if (running && running.id !== id) {
@@ -653,25 +995,235 @@ export async function updateActual(id: string, patch: ActualPatch): Promise<Upda
     return { ok: false, reason: "would-overlap-running" };
   }
 
+  return { ok: true, merged };
+}
+
+function updateActualStmt(id: string, merged: MergedActual, nowMs: number): Stmt {
+  return {
+    sql: UPDATE_ACTUAL_SQL,
+    args: [merged.categoryId, merged.title, merged.startAt, merged.endAt, merged.notes, nowMs, id],
+  };
+}
+
+/**
+ * Two round trips: one `"read"` batch for all three pre-checks, one `"write"`
+ * batch for the UPDATE and (unless `hydrate: false`) the read-back.
+ *
+ * The pre-checks used to be issued serially because the lane lookup needed
+ * `existing.track`, which only arrives with the first read. `RUNNING_ON_LANE_OF_SQL`
+ * re-derives the lane with a correlated subquery instead, which frees all
+ * three to travel together.
+ */
+export async function updateActual(
+  id: string,
+  patch: ActualPatch,
+  opts?: { hydrate?: true },
+): Promise<UpdateActualResult>;
+export async function updateActual(
+  id: string,
+  patch: ActualPatch,
+  opts: { hydrate: false },
+): Promise<UpdateActualResultLean>;
+export async function updateActual(
+  id: string,
+  patch: ActualPatch,
+  opts?: HydrateOptions,
+): Promise<UpdateActualResult | UpdateActualResultLean> {
+  await initDb();
+  const hydrate = opts?.hydrate !== false;
+
+  const reads: Stmt[] = [{ sql: ACTUAL_BY_ID_SQL, args: [id] }];
+  const catIdx = patch.categoryId
+    ? reads.push({ sql: CATEGORY_EXISTS_SQL, args: [patch.categoryId] }) - 1
+    : -1;
+  const laneIdx = reads.push({ sql: RUNNING_ON_LANE_OF_SQL, args: [id] }) - 1;
+  const readRs = await batchStmts(reads, "read");
+
+  // Check order is load-bearing: callers surface `reason` verbatim, so
+  // not-found must still win over invalid-category, and both over the
+  // interval checks.
+  const existing = firstActual(readRs[0]);
+  if (!existing) return { ok: false, reason: "not-found" };
+  if (catIdx >= 0 && readRs[catIdx].rows.length === 0) {
+    return { ok: false, reason: "invalid-category" };
+  }
+
+  const checked = mergeAndValidateActual(id, existing, patch, firstActual(readRs[laneIdx]));
+  if (!checked.ok) return { ok: false, reason: checked.reason };
+
   // Catch the partial UNIQUE violation as a fallback for the TOCTOU window
-  // between `getRunningActual` above and the UPDATE below. App-level pre-check
+  // between the read batch above and the UPDATE below. App-level pre-check
   // gives a cleaner error in the uncontested case; the catch covers races.
+  // Batching the pre-checks narrowed that window, it did not remove it.
+  const stmts: Stmt[] = [updateActualStmt(id, checked.merged, Date.now())];
+  const rowIdx = hydrate ? stmts.push({ sql: ACTUAL_BY_ID_SQL, args: [id] }) - 1 : -1;
+  let writeRs;
   try {
-    await db.execute({
-      sql: `UPDATE calendar_actuals
-            SET category_id=?, title=?, start_at=?, end_at=?, notes=?, updated_at=?
-            WHERE id=?`,
-      args: [merged.categoryId, merged.title, merged.startAt, merged.endAt, merged.notes, Date.now(), id],
-    });
+    writeRs = await batchStmts(stmts, "write");
   } catch (e) {
     if (isRunningUniqueViolation(e)) {
       return { ok: false, reason: "would-overlap-running" };
     }
     throw e;
   }
-  const updated = await getActualById(id);
+  if (!hydrate) return { ok: true, actual: null };
+  const updated = firstActual(writeRs[rowIdx]);
   if (!updated) throw new Error("Failed to load updated actual");
   return { ok: true, actual: updated };
+}
+
+/** What a segment reopens with. Same shape as a start, minus the two fields
+ *  {@link segmentActuals} supplies for the whole batch. */
+export type LaneResume = Omit<StartActualInput, "timezone" | "nowMs">;
+
+export type LaneSegment = {
+  /** The running row to describe and close. */
+  id: string;
+  /** Written onto the row BEFORE it is closed. Omit (or pass an empty object)
+   *  to close without describing — which also skips the pre-checks a describe
+   *  needs, exactly as the un-fused stop+describe pair did. */
+  patch?: ActualPatch;
+  /** Non-null to immediately reopen the lane with a fresh row. */
+  resume: LaneResume | null;
+};
+
+export type SegmentActualsResult =
+  | { ok: true; lanes: CalendarActual[] }
+  | {
+      ok: false;
+      /** Which segment failed; null only when a constraint race in the shared
+       *  transaction can't be pinned on one of several segments. */
+      index: number | null;
+      /** Which half failed. `invalid-category` can come from either, so
+       *  callers need this to phrase the message the way they always have. */
+      phase: "close" | "open";
+      reason:
+        | "not-found"
+        | "start-after-end"
+        | "would-overlap-running"
+        | "invalid-category"
+        | "invalid-plan"
+        | "concurrent-start";
+    };
+
+/**
+ * Closes a set of running rows — each optionally described first, each
+ * optionally reopened — as ONE transaction, in two round trips regardless of
+ * how many lanes are involved.
+ *
+ * The describe-then-close ordering is the whole reason this exists as a fused
+ * operation rather than a loop over `updateActual` + `stopActualById`. Writing
+ * the description while the row is still running keeps the note attached to
+ * the right entry even if the close then loses a race to another client;
+ * statements inside a `db.batch` execute in the order given, so the ordering
+ * survives the fusing intact.
+ *
+ * The lane snapshot for a resume is taken in the read batch, i.e. BEFORE the
+ * close — same as `startActual`, and normally it just names the row this
+ * segment is about to close, which is why that stop is emitted once rather
+ * than twice. If some other client has taken the lane in the meantime it gets
+ * displaced, which is exactly what starting a lane has always meant.
+ *
+ * `opts.timezone` is only consulted by resuming segments (it anchors the new
+ * row's `date`), so a pure close needs no site config read at all. Passing a
+ * resuming segment without it is a programming error, not a runtime condition.
+ */
+export async function segmentActuals(
+  segments: LaneSegment[],
+  opts?: { nowMs?: number; timezone?: string },
+): Promise<SegmentActualsResult> {
+  await initDb();
+  if (segments.length === 0) return { ok: true, lanes: await getRunningActuals() };
+
+  const now = opts?.nowMs ?? Date.now();
+  const timezone = opts?.timezone;
+
+  type SegmentSlots = {
+    existing: number;
+    category: number;
+    lane: number;
+    start: StartReadSlots | null;
+    startInput: StartActualInput | null;
+  };
+
+  const reads: Stmt[] = [];
+  const slots: SegmentSlots[] = segments.map((seg) => {
+    const s: SegmentSlots = { existing: -1, category: -1, lane: -1, start: null, startInput: null };
+    const patch = seg.patch;
+    if (patch && Object.keys(patch).length > 0) {
+      s.existing = reads.push({ sql: ACTUAL_BY_ID_SQL, args: [seg.id] }) - 1;
+      if (patch.categoryId) {
+        s.category = reads.push({ sql: CATEGORY_EXISTS_SQL, args: [patch.categoryId] }) - 1;
+      }
+      s.lane = reads.push({ sql: RUNNING_ON_LANE_OF_SQL, args: [seg.id] }) - 1;
+    }
+    if (seg.resume) {
+      if (!timezone) {
+        throw new Error("segmentActuals: a resuming segment requires opts.timezone");
+      }
+      s.startInput = { ...seg.resume, timezone, nowMs: now };
+      s.start = pushStartReads(reads, s.startInput);
+    }
+    return s;
+  });
+
+  const readRs = reads.length > 0 ? await batchStmts(reads, "read") : [];
+
+  const writes: Stmt[] = [];
+  let anyResume = false;
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const s = slots[i];
+
+    if (s.existing >= 0 && seg.patch) {
+      const existing = firstActual(readRs[s.existing]);
+      if (!existing) return { ok: false, index: i, phase: "close", reason: "not-found" };
+      if (s.category >= 0 && readRs[s.category].rows.length === 0) {
+        return { ok: false, index: i, phase: "close", reason: "invalid-category" };
+      }
+      const checked = mergeAndValidateActual(
+        seg.id,
+        existing,
+        seg.patch,
+        firstActual(readRs[s.lane]),
+      );
+      if (!checked.ok) return { ok: false, index: i, phase: "close", reason: checked.reason };
+      writes.push(updateActualStmt(seg.id, checked.merged, now));
+    }
+
+    writes.push({ sql: STOP_ACTUAL_SQL, args: [now, now, seg.id] });
+
+    if (s.start && s.startInput) {
+      anyResume = true;
+      const step = consumeStartReads(readRs, s.start, s.startInput, now);
+      if (!step.ok) return { ok: false, index: i, phase: "open", reason: step.reason };
+      // The row we just closed is normally the very row holding the lane, so
+      // its stop is already queued above — don't queue it twice.
+      if (step.prepared.stop && step.prepared.displacedId !== seg.id) {
+        writes.push(step.prepared.stop);
+      }
+      writes.push(step.prepared.insert);
+    }
+  }
+
+  const lanesIdx = writes.push({ sql: RUNNING_LANES_SQL, args: [] }) - 1;
+
+  try {
+    const writeRs = await batchStmts(writes, "write");
+    return { ok: true, lanes: toActuals(writeRs[lanesIdx]) };
+  } catch (e) {
+    if (isRunningUniqueViolation(e)) {
+      // libsql reports the constraint, not the statement, so attribute the
+      // race to the only kind of statement in this batch that can plausibly
+      // trip it: an INSERT of a new open row. With no resume in the batch the
+      // only remaining candidate is a describe-UPDATE reopening a taken lane.
+      const index = segments.length === 1 ? 0 : null;
+      return anyResume
+        ? { ok: false, index, phase: "open", reason: "concurrent-start" }
+        : { ok: false, index, phase: "close", reason: "would-overlap-running" };
+    }
+    throw e;
+  }
 }
 
 export async function deleteActual(id: string): Promise<{ ok: boolean }> {
@@ -763,10 +1315,7 @@ export async function loadDayPageData(date: string, yesterday: string): Promise<
         args: [date, date],
       },
       {
-        sql: `SELECT a.*, c.id AS cat_id, c.name AS cat_name, c.color AS cat_color, p.title AS plan_title
-              FROM calendar_actuals a
-              LEFT JOIN calendar_categories c ON c.id = a.category_id
-              LEFT JOIN calendar_tasks p ON p.id = a.plan_id
+        sql: `${ACTUAL_SELECT}
               WHERE (a.date BETWEEN ? AND ?)
                  OR (a.end_at IS NULL AND a.date <= ?)
               ORDER BY a.start_at ASC`,
@@ -782,7 +1331,7 @@ export async function loadDayPageData(date: string, yesterday: string): Promise<
   );
 
   const tasks = (tasksRs.rows as unknown as DbCalendarTaskJoined[]).map(rowToTask);
-  const actuals = (actualsRs.rows as unknown as DbCalendarActualJoined[]).map(rowToActual);
+  const actuals = toActuals(actualsRs);
   const categories = (categoriesRs.rows as unknown as DbCalendarCategory[]).map(rowToCategory);
 
   return { tasks, actuals, categories };
