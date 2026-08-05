@@ -17,7 +17,6 @@ export type HoursEntry = {
   id: string;
   categoryId: string | null;
   title: string | null;
-  notes: string | null;
   startAt: number;
   /** Running entries are clamped to "now" so live time is reflected. */
   endAt: number;
@@ -61,14 +60,23 @@ export type HoursOverview = {
  * thousands of rows at the very worst — so aggregating in JS keeps the
  * interval math readable and exact. Move the sums into SQL only if that stops
  * being true; the union step would still have to happen here.
+ *
+ * `notes` is deliberately absent. Everything this query returns flows into the
+ * unauthenticated `/` and `/s/[subject]`, and notes are the one private field
+ * on an entry — the log is public, the diary attached to it is not. Nothing
+ * rendered there reads them, and leaving them selected meant the only thing
+ * standing between a private note and the wire was `entry-list.tsx` happening
+ * to be a Server Component: adding `"use client"` to it would have serialized
+ * every note into the page with no error and nothing visibly different. If a
+ * signed-in surface ever needs notes, give it its own query.
  */
-const ENTRY_LIST_SQL = `SELECT id, date, category_id, title, notes, start_at, end_at, track
+const ENTRY_LIST_SQL = `SELECT id, date, category_id, title, start_at, end_at, track
           FROM calendar_actuals
           ORDER BY start_at DESC`;
 
 type DbEntryRow = Pick<
   DbCalendarActual,
-  "id" | "date" | "category_id" | "title" | "notes" | "start_at" | "end_at" | "track"
+  "id" | "date" | "category_id" | "title" | "start_at" | "end_at" | "track"
 >;
 
 function rowToEntry(r: DbEntryRow, nowMs: number): HoursEntry {
@@ -77,7 +85,6 @@ function rowToEntry(r: DbEntryRow, nowMs: number): HoursEntry {
     id: r.id,
     categoryId: r.category_id,
     title: r.title,
-    notes: r.notes,
     startAt: Number(r.start_at),
     // A running row has no end yet; clamp to now so live time counts. Guard
     // against a start in the future (clock skew) collapsing to negative.
@@ -133,6 +140,11 @@ export const getHoursOverview = cache(async (nowMs: number = Date.now()): Promis
   // having shared its hour with another.
   const buckets = new Map<string | null, Interval[]>();
   const meta = new Map<string | null, { first: number; last: number; count: number }>();
+  // Accumulated here rather than derived later with `Math.min(...entries.map())`:
+  // spreading one argument per row blows the call stack somewhere past ~125k
+  // entries, and the pass over every entry is already happening.
+  let firstAt: number | null = null;
+  let lastAt: number | null = null;
   for (const e of entries) {
     const key = e.categoryId;
     if (!buckets.has(key)) buckets.set(key, []);
@@ -144,6 +156,8 @@ export const getHoursOverview = cache(async (nowMs: number = Date.now()): Promis
       m.last = Math.max(m.last, e.endAt);
       m.count++;
     }
+    if (firstAt === null || e.startAt < firstAt) firstAt = e.startAt;
+    if (lastAt === null || e.endAt > lastAt) lastAt = e.endAt;
   }
 
   const subjects: Subject[] = [...buckets.entries()]
@@ -189,8 +203,8 @@ export const getHoursOverview = cache(async (nowMs: number = Date.now()): Promis
     daily,
     entries,
     timezone,
-    firstAt: entries.length ? Math.min(...entries.map((e) => e.startAt)) : null,
-    lastAt: entries.length ? Math.max(...entries.map((e) => e.endAt)) : null,
+    firstAt,
+    lastAt,
     runningCount: entries.filter((e) => e.running).length,
   };
 });
