@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "predev": "bun run icons",
+    "predev": "node scripts/build-icons.mjs",
     "dev": "next dev",
-    "prebuild": "bun run icons",
+    "prebuild": "node scripts/build-icons.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
