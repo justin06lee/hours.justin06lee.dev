@@ -16,7 +16,8 @@ import { DialogProvider, useDialog } from "@/components/chrome/dialog";
 import { ToastProvider, useToast } from "@/components/chrome/toast";
 import { ModalPanel } from "@/components/modal-panel";
 import { deleteEntry, updateEntry } from "@/app/actions";
-import type { JournalEntry, Subject } from "@/lib/hours";
+import type { JournalEntry } from "@/lib/hours";
+import type { CalendarCategory } from "@/lib/calendar-categories";
 import { formatElapsed } from "@/lib/hours-math";
 import {
   epochToDateInTz,
@@ -28,10 +29,21 @@ import { cn } from "@/lib/utils";
 
 export type JournalListProps = {
   entries: JournalEntry[];
-  subjects: Subject[];
+  /**
+   * Every category, from `listCategories` — **not** `overview.subjects`.
+   *
+   * The subject list is built from the entries that exist, so a category
+   * nothing has been logged against yet is absent from it. Driving the editor's
+   * dropdown off that made a freshly created subject unselectable: it existed,
+   * it was offered when starting a lane, and it was the one thing you could not
+   * move an old entry to.
+   */
+  categories: CalendarCategory[];
   timezone: string;
   page: number;
   pageCount: number;
+  /** Total matching entries, so a bounded list can say it is bounded. */
+  total: number;
   /** True when the list is filtered to entries carrying a reflection. */
   notedOnly: boolean;
 };
@@ -59,10 +71,11 @@ type Draft = {
 
 function Journal({
   entries,
-  subjects,
+  categories,
   timezone,
   page,
   pageCount,
+  total,
   notedOnly,
 }: JournalListProps) {
   const router = useRouter();
@@ -75,17 +88,44 @@ function Journal({
   const [formError, setFormError] = useState<string | null>(null);
   const titleId = useId();
 
-  const colorOf = new Map(subjects.map((s) => [s.id, s.color]));
-  const nameOf = new Map(subjects.map((s) => [s.id, s.name]));
+  const byId = new Map(categories.map((c) => [c.id, c]));
 
-  const options = [
+  /**
+   * An entry's subject colour, and its name or `null`.
+   *
+   * Null covers two cases that render identically and should: a genuinely
+   * uncategorized entry, and one whose `categoryId` points at a category that
+   * no longer exists. The second is reachable — the FK is declared
+   * `ON DELETE SET NULL` but libsql does not enable `PRAGMA foreign_keys`, so a
+   * row deleted from the sibling site leaves the reference dangling rather than
+   * blanking it.
+   *
+   * Returning null rather than the string "uncategorized" is what keeps the
+   * `title || name || "untitled"` chain working — a non-null fallback here
+   * makes the "untitled" branch dead and prints "· uncategorized" after every
+   * entry that has a title but no subject. The public entry list resolves these
+   * the same way, and the two lists showing the same row differently would be
+   * worse than either choice.
+   */
+  const UNCATEGORIZED = "#7a8085";
+  const colorFor = (id: string | null) => (id ? byId.get(id)?.color ?? UNCATEGORIZED : UNCATEGORIZED);
+  const nameFor = (id: string | null): string | null => (id ? byId.get(id)?.name ?? null : null);
+
+  /**
+   * Live categories, plus whichever one this entry is already filed under even
+   * if it has been archived. Without that second half, opening an entry on an
+   * archived subject would show an empty select, and saving would quietly move
+   * the entry to "no subject" — losing the filing to a dropdown that simply
+   * declined to mention it.
+   */
+  const optionsFor = (currentId: string | null) => [
     { value: "", label: "no subject" },
-    ...subjects
-      .filter((s) => s.id !== null)
-      .map((s) => ({
-        value: s.id!,
-        label: s.name.toLowerCase(),
-        prefix: <span aria-hidden className="size-2 shrink-0" style={{ background: s.color }} />,
+    ...categories
+      .filter((c) => !c.archived || c.id === currentId)
+      .map((c) => ({
+        value: c.id,
+        label: c.archived ? `${c.name.toLowerCase()} (archived)` : c.name.toLowerCase(),
+        prefix: <span aria-hidden className="size-2 shrink-0" style={{ background: c.color }} />,
       })),
   ];
 
@@ -187,7 +227,7 @@ function Journal({
   };
 
   const remove = async (entry: JournalEntry) => {
-    const label = entry.title || nameOf.get(entry.categoryId) || "this entry";
+    const label = entry.title || nameFor(entry.categoryId) || "this entry";
     const ok = await confirm({
       title: `delete ${label.toLowerCase()}?`,
       message:
@@ -269,14 +309,14 @@ function Journal({
                     <span
                       aria-hidden
                       className="mt-1 size-1.5 shrink-0"
-                      style={{ background: colorOf.get(e.categoryId) ?? "#7a8085" }}
+                      style={{ background: colorFor(e.categoryId) }}
                     />
                     <span className="min-w-0 flex-1 truncate text-white/80">
-                      {e.title || nameOf.get(e.categoryId) || "untitled"}
-                      {e.title && nameOf.get(e.categoryId) && (
+                      {e.title || nameFor(e.categoryId) || "untitled"}
+                      {e.title && nameFor(e.categoryId) && (
                         <span className="text-white/30">
                           {" "}
-                          · {nameOf.get(e.categoryId)!.toLowerCase()}
+                          · {nameFor(e.categoryId)?.toLowerCase()}
                         </span>
                       )}
                     </span>
@@ -332,12 +372,16 @@ function Journal({
         ))}
       </div>
 
+      <p className="mt-8 font-mono text-[11px] uppercase tracking-[0.18em] text-white/30">
+        {entries.length} of {total} {total === 1 ? "entry" : "entries"}
+      </p>
+
       {/* Returns null at one page or fewer, so this is safe to render flat. */}
       <Pagination
         page={page}
         pageCount={pageCount}
         onChange={goToPage}
-        className="mt-10"
+        className="mt-4"
       />
 
       <ModalPanel open={editing !== null} onClose={closeEditor} labelledBy={titleId}>
@@ -361,7 +405,7 @@ function Journal({
                 <Select
                   value={draft.categoryId}
                   onChange={(v) => setDraft({ ...draft, categoryId: String(v) })}
-                  options={options}
+                  options={optionsFor(editing.categoryId)}
                   placeholder="subject"
                   ariaLabel="subject"
                 />

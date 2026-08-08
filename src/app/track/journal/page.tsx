@@ -2,6 +2,7 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { isAdminServer } from "@/lib/auth-server";
 import { getHoursOverview, getJournalPage } from "@/lib/hours";
+import { listCategories } from "@/lib/calendar-categories";
 import { pageToOffset } from "@/lib/calendar-validate";
 import { JournalList } from "@/components/journal-list";
 import { cn } from "@/lib/utils";
@@ -34,8 +35,13 @@ export default async function JournalPage({
   const notedOnly = params.notes === "1";
   const offset = pageToOffset(params.page, PAGE_SIZE);
 
-  const [overview, journal] = await Promise.all([
+  // `listCategories`, not `overview.subjects`: the subject list is derived from
+  // the entries that exist, so a category nothing has been logged against yet
+  // is missing from it — and that is exactly the one the editor's dropdown has
+  // to be able to offer.
+  const [overview, categories, journal] = await Promise.all([
     getHoursOverview(),
+    listCategories(),
     getJournalPage({ limit: PAGE_SIZE, offset, notedOnly }),
   ]);
 
@@ -67,10 +73,11 @@ export default async function JournalPage({
 
       <JournalList
         entries={journal.entries}
-        subjects={overview.subjects}
+        categories={categories}
         timezone={overview.timezone}
         page={page}
         pageCount={pageCount}
+        total={journal.total}
         notedOnly={notedOnly}
       />
     </>
