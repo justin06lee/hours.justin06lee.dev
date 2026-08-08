@@ -29,12 +29,20 @@ import {
 } from "@/lib/calendar";
 import { MAX_TRACK, PRIMARY_TRACK, isValidTrack } from "@/lib/calendar-constants";
 import {
+  MAX_NAME_LEN,
   MAX_NOTES_LEN,
   MAX_TITLE_LEN,
   isEntryId,
   isFiniteEpochMs,
   isStringWithin,
 } from "@/lib/calendar-validate";
+import {
+  categoryUsage,
+  createCategory,
+  deleteCategory,
+  updateCategory,
+} from "@/lib/calendar-categories";
+import { isPaletteColor } from "@/lib/colors";
 import { getSiteConfig, resolveTimezone } from "@/lib/site-config";
 
 /**
@@ -516,4 +524,182 @@ export async function deleteEntry(input: { id: string }): Promise<EntryResult> {
 
   revalidateAll();
   return { ok: true };
+}
+
+/* ── Subjects ──────────────────────────────────────────────────────────────
+ *
+ * Categories are the buckets every hour on the site is filed under, and until
+ * now they could only be created on the sibling site — this app read them and
+ * offered no way to add, rename, recolor or retire one. The library functions
+ * were all there; none of them had a caller.
+ *
+ * `calendar_categories` is shared with justin06lee.dev, so these are writes to
+ * a table another app reads. Everything below leans on the constraints that
+ * table already carries rather than inventing new rules: UNIQUE(LOWER(name)),
+ * the `is_system` lock on the seeded Sleep row, and the in-use check before a
+ * delete.
+ */
+
+export type SubjectResult = { ok: true } | { ok: false; error: string };
+
+/** Shared shape check for a name, so create and rename can't diverge on it. */
+function checkName(name: unknown): { ok: true; value: string } | { ok: false; error: string } {
+  if (!isStringWithin(name, MAX_NAME_LEN)) {
+    return { ok: false, error: `name must be ${MAX_NAME_LEN} characters or fewer` };
+  }
+  const trimmed = name.trim();
+  if (trimmed.length === 0) return { ok: false, error: "give it a name" };
+  return { ok: true, value: trimmed };
+}
+
+/**
+ * The palette gate, applied here as well as in the library.
+ *
+ * `createCategory`/`updateCategory` both check it too, and that is the check
+ * that actually protects the column. This one exists so the action returns the
+ * same lowercase sentence as every other failure here, rather than the
+ * library's `invalid-color` reason leaking through a generic branch.
+ */
+function checkColor(color: unknown): { ok: true; value: string } | { ok: false; error: string } {
+  if (typeof color !== "string" || !isPaletteColor(color)) {
+    return { ok: false, error: "pick a color from the palette" };
+  }
+  return { ok: true, value: color };
+}
+
+export async function createSubject(input: {
+  name: string;
+  color: string;
+}): Promise<SubjectResult> {
+  await assertAdmin();
+
+  const name = checkName(input.name);
+  if (!name.ok) return name;
+  const color = checkColor(input.color);
+  if (!color.ok) return color;
+
+  const result = await createCategory({ name: name.value, color: color.value });
+  if (!result.ok) {
+    return {
+      ok: false,
+      error:
+        result.reason === "duplicate"
+          ? "a subject with that name already exists"
+          : result.reason === "invalid-color"
+            ? "pick a color from the palette"
+            : "give it a name",
+    };
+  }
+
+  revalidateAll();
+  return { ok: true };
+}
+
+/**
+ * Renames, recolors, archives or unarchives one subject.
+ *
+ * Archiving rather than deleting is the normal way to retire a subject: the
+ * hours already filed under it stay exactly where they are and keep counting,
+ * the subject just stops being offered when starting a lane. Deleting is for
+ * a subject that was a mistake, and is refused outright once anything points
+ * at it.
+ */
+export async function updateSubject(input: {
+  id: string;
+  name?: string;
+  color?: string;
+  archived?: boolean;
+}): Promise<SubjectResult> {
+  await assertAdmin();
+  if (!isEntryId(input.id)) return { ok: false, error: "missing subject" };
+
+  const patch: { name?: string; color?: string; archived?: boolean } = {};
+
+  if (input.name !== undefined) {
+    const name = checkName(input.name);
+    if (!name.ok) return name;
+    patch.name = name.value;
+  }
+  if (input.color !== undefined) {
+    const color = checkColor(input.color);
+    if (!color.ok) return color;
+    patch.color = color.value;
+  }
+  if (input.archived !== undefined) {
+    if (typeof input.archived !== "boolean") return { ok: false, error: "could not save" };
+    patch.archived = input.archived;
+  }
+
+  if (Object.keys(patch).length === 0) return { ok: true };
+
+  const result = await updateCategory(input.id, patch);
+  if (!result.ok) {
+    return {
+      ok: false,
+      error:
+        result.reason === "not-found"
+          ? "that subject no longer exists"
+          : result.reason === "duplicate"
+            ? "a subject with that name already exists"
+            : result.reason === "system-name-locked"
+              ? "sleep is built in — it can be recolored but not renamed"
+              : result.reason === "invalid-color"
+                ? "pick a color from the palette"
+                : "give it a name",
+    };
+  }
+
+  revalidateAll();
+  return { ok: true };
+}
+
+/**
+ * Deletes a subject, but only one nothing is filed under.
+ *
+ * `deleteCategory` counts plans and actuals first and refuses when either is
+ * non-zero, which is the right rule for a table shared with the sibling site:
+ * the FK is declared `ON DELETE SET NULL` but libsql does not enable
+ * `PRAGMA foreign_keys`, so a delete would not blank the references — it would
+ * strand them, and every hour filed under that subject would silently become
+ * uncategorized. The count comes back with the refusal so the message can say
+ * how much is in the way.
+ */
+export async function deleteSubject(input: { id: string }): Promise<SubjectResult> {
+  await assertAdmin();
+  if (!isEntryId(input.id)) return { ok: false, error: "missing subject" };
+
+  const result = await deleteCategory(input.id);
+  if (!result.ok) {
+    if (result.reason === "in-use") {
+      const entries = result.actualCount ?? 0;
+      const plans = result.planCount ?? 0;
+      const parts: string[] = [];
+      if (entries > 0) parts.push(`${entries} ${entries === 1 ? "entry" : "entries"}`);
+      if (plans > 0) parts.push(`${plans} ${plans === 1 ? "plan" : "plans"}`);
+      return {
+        ok: false,
+        error: `${parts.join(" and ")} still point at it — archive it instead`,
+      };
+    }
+    return {
+      ok: false,
+      error:
+        result.reason === "system-locked"
+          ? "sleep is built in and can't be deleted"
+          : "that subject no longer exists",
+    };
+  }
+
+  revalidateAll();
+  return { ok: true };
+}
+
+/** How much is filed under a subject, for the delete confirmation. */
+export async function getSubjectUsage(
+  id: string,
+): Promise<{ entries: number; plans: number }> {
+  await assertAdmin();
+  if (!isEntryId(id)) return { entries: 0, plans: 0 };
+  const usage = await categoryUsage(id);
+  return { entries: usage.actualCount, plans: usage.planCount };
 }
