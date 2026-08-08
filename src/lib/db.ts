@@ -134,6 +134,15 @@ const SCHEMA_DDL: string[] = [
   // Both were full table scans.
   `CREATE INDEX IF NOT EXISTS idx_calendar_actuals_category ON calendar_actuals(category_id)`,
   `CREATE INDEX IF NOT EXISTS idx_calendar_actuals_start_at ON calendar_actuals(start_at)`,
+  // The subject page pages entries with `WHERE category_id = ? ORDER BY
+  // start_at DESC LIMIT ?`. On the single-column category index above, SQLite
+  // can seek the subject but must then sort every one of its rows to find the
+  // newest handful — the sort grows with the subject while the page stays 20
+  // rows. Leading with the same equality column and carrying `start_at` as the
+  // second lets the index satisfy the ordering too, so the LIMIT stops the scan
+  // early. The single-column index stays: categoryUsage() counts by category
+  // alone and is better served by the narrower one.
+  `CREATE INDEX IF NOT EXISTS idx_calendar_actuals_category_start ON calendar_actuals(category_id, start_at)`,
   // NOTE: the partial UNIQUE index guarding the running-row invariant lives in
   // POST_STEPS, not here, because it is built on `track` — a column older
   // installations only acquire via COLUMN_SPECS a step later.

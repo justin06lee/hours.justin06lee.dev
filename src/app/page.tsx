@@ -2,7 +2,7 @@ import { StatTile } from "@/components/chrome/stat-tile";
 import { Streak } from "@/components/chrome/streak";
 import { HoursBarList, HoursHeatmap } from "@/components/hours-charts";
 import { FadeIn } from "@/components/chrome/fade-in";
-import { getHoursOverview } from "@/lib/hours";
+import { getEntryPage, getHoursOverview } from "@/lib/hours";
 import { computeStreak, formatHours, MS_PER_HOUR } from "@/lib/hours-math";
 import { todayInTz } from "@/lib/calendar-dates";
 import { EntryList } from "@/components/entry-list";
@@ -16,8 +16,19 @@ export const dynamic = "force-dynamic";
 // engines that every subject page is a duplicate of this one.
 export const metadata = { alternates: { canonical: "/" } };
 
+/** How many entries the homepage's "recent" section shows. */
+const RECENT_LIMIT = 20;
+
 export default async function HomePage() {
-  const overview = await getHoursOverview();
+  // Concurrent rather than sequential: the aggregate and the recent page are
+  // independent queries against the same snapshot-free read, and neither needs
+  // the other's result. Both take their "now" from the request-scoped
+  // `requestNow()`, so a running entry is clamped to the same instant in the
+  // headline total and in the list beneath it.
+  const [overview, recent] = await Promise.all([
+    getHoursOverview(),
+    getEntryPage({ limit: RECENT_LIMIT }),
+  ]);
   const today = todayInTz(overview.timezone);
   const year = Number(today.slice(0, 4));
 
@@ -123,7 +134,7 @@ export default async function HomePage() {
             recent
           </h2>
           <EntryList
-            entries={overview.entries.slice(0, 20)}
+            entries={recent.entries}
             subjects={overview.subjects}
             timezone={overview.timezone}
           />

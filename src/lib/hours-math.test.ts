@@ -4,6 +4,8 @@ import {
   unionMs,
   rawMs,
   splitByDay,
+  dailyUnion,
+  activeYears,
   computeStreak,
   formatHours,
   formatElapsed,
@@ -241,6 +243,95 @@ describe("splitByDay — day boundaries land on true local midnight", () => {
     expect(segs.length).toBe(10_000);
     expect(warn).toHaveBeenCalledTimes(1);
     expect(String(warn.mock.calls[0][0])).toContain("truncated");
+  });
+});
+
+describe("dailyUnion — the one producer behind both heatmaps", () => {
+  const TZ = "America/New_York";
+  // 2026-06-30, EDT (UTC-4).
+  const at = (hhmm: string) => Date.parse(`2026-06-30T${hhmm}:00.000-04:00`);
+
+  it("returns nothing for no intervals", () => {
+    expect(dailyUnion([], TZ)).toEqual({});
+  });
+
+  it("sums disjoint spans within a day", () => {
+    const daily = dailyUnion(
+      [
+        { start: at("09:00"), end: at("11:00") },
+        { start: at("14:00"), end: at("15:00") },
+      ],
+      TZ,
+    );
+    expect(daily).toEqual({ "2026-06-30": 3 * H });
+  });
+
+  it("counts two lanes running at once ONCE, not twice", () => {
+    // The whole reason a day's cell unions rather than sums: coding while a
+    // workout is timed is one hour of that afternoon, not two.
+    const parallel = dailyUnion(
+      [
+        { start: at("13:00"), end: at("14:00") },
+        { start: at("13:00"), end: at("14:00") },
+      ],
+      TZ,
+    );
+    expect(parallel).toEqual({ "2026-06-30": 1 * H });
+  });
+
+  it("merges partially overlapping lanes into their covered span", () => {
+    const daily = dailyUnion(
+      [
+        { start: at("13:00"), end: at("14:30") },
+        { start: at("14:00"), end: at("15:00") },
+      ],
+      TZ,
+    );
+    expect(daily).toEqual({ "2026-06-30": 2 * H });
+  });
+
+  it("splits a cross-midnight span across both days it touches", () => {
+    const daily = dailyUnion(
+      [{ start: at("23:00"), end: at("23:00") + 2 * H }],
+      TZ,
+    );
+    expect(daily).toEqual({ "2026-06-30": 1 * H, "2026-07-01": 1 * H });
+  });
+
+  it("unions per day, not across days", () => {
+    // Two lanes overlapping across the same midnight: each day still counts its
+    // own covered time once.
+    const daily = dailyUnion(
+      [
+        { start: at("23:00"), end: at("23:00") + 2 * H },
+        { start: at("23:30"), end: at("23:30") + 2 * H },
+      ],
+      TZ,
+    );
+    expect(daily).toEqual({ "2026-06-30": 1 * H, "2026-07-01": 1.5 * H });
+  });
+});
+
+describe("activeYears", () => {
+  it("returns nothing for an empty map", () => {
+    expect(activeYears({})).toEqual([]);
+  });
+
+  it("lists each year once, newest first", () => {
+    expect(
+      activeYears({
+        "2024-03-01": H,
+        "2026-01-09": H,
+        "2024-11-30": H,
+        "2025-07-04": H,
+      }),
+    ).toEqual([2026, 2025, 2024]);
+  });
+
+  it("omits a year whose only days are worth zero", () => {
+    // splitByDay can emit a zero-length segment exactly on a boundary. Offering
+    // that year in the switcher would open the heatmap on an empty grid.
+    expect(activeYears({ "2024-01-01": 0, "2026-05-05": H })).toEqual([2026]);
   });
 });
 

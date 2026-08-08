@@ -24,6 +24,32 @@ database or environment coupling so the part that decides whether the numbers
 are honest can be tested on its own (`src/lib/hours-math.test.ts`).
 `src/lib/hours.ts` only loads rows and applies it.
 
+The rule applies **all the way down**, not just to the headline: the per-title
+breakdown on a subject page unions too, so those bars can never add up to more
+than the subject total printed above them.
+
+## Two kinds of query
+
+`src/lib/hours.ts` is shaped by one distinction, and it is worth knowing before
+adding a query to it:
+
+- **The aggregate** (`getHoursOverview`) reads *every row*, because a union is
+  exact or it is nothing — there is no way to push interval merging into SQLite
+  and still answer "how many hours have actually elapsed". It reads only three
+  narrow columns to do it, never the text.
+- **The display queries** (`getEntryPage`, `getJournalPage`,
+  `getSubjectBreakdown`) are **bounded**. Nothing rendered as a list is
+  unbounded, and nothing unbounded is rendered as a list.
+
+That costs one extra round trip per page versus a single batch, which is the
+deliberate trade: one hop that streams the whole table on every view of a public
+page, and grows forever, is worse than two that each stay small.
+
+`notes` is selected by exactly one of them. It is the only private field on an
+entry — the log is public, the diary attached to it is not — so `getJournalPage`
+is the only query that reads it, and every caller of that sits behind the admin
+gate.
+
 ## Shared database
 
 Turso / libsql, **shared with the sibling site justin06lee.dev**. This app reads
