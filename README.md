@@ -60,6 +60,14 @@ That is why `src/lib/` carries schema and helpers this app never calls — the
 schema in `src/lib/db.ts` is the full shared one, and both sites run the same
 idempotent `initDb()`. Don't prune the "unused" tables; the other site owns them.
 
+**Running the app migrates the database.** `initDb()` runs on the first request
+of any cold start, including `next dev`, and the schema is gated on a fingerprint
+hashed from the migration data itself — so editing `SCHEMA_DDL` and then loading
+a page applies that edit to whatever `TURSO_DATABASE_URL` points at. Every step
+is idempotent and additive by design, but if you don't want a local run touching
+the shared database, point `TURSO_DATABASE_URL` at a scratch file
+(`file:./scratch.db`) and the schema will build itself there instead.
+
 `next.config.ts` lists the libsql packages in `serverExternalPackages` because
 they ship native bindings that break at runtime if bundled. That list mirrors
 justin06lee.dev's.
@@ -73,10 +81,10 @@ Four variables, all required in production:
 | `TURSO_DATABASE_URL` | `src/lib/db.ts` | libsql connection URL |
 | `TURSO_AUTH_TOKEN` | `src/lib/db.ts` | libsql auth token |
 | `ADMIN_KEY` | `src/lib/auth.ts` | admin password. Unset disables admin login entirely (logs a warning) |
-| `NEXT_PUBLIC_SITE_URL` | `src/app/layout.tsx` | metadata base for canonical/OG URLs. Falls back to `https://hours.justin06lee.dev` |
+| `NEXT_PUBLIC_SITE_URL` | `src/lib/site-url.ts` | origin for canonicals, OG tags, `robots.txt` and the sitemap. Falls back to `https://hours.justin06lee.dev` |
 
 Put them in `.env.local`. `.gitignore` covers `.env*` but negates
-`.env.example`, so a committed template of the *names* is possible.
+`.env.example`, which is committed as a template of the *names* — copy it.
 
 ## Routes
 
@@ -153,9 +161,9 @@ mode. Three files cover it:
 
 | File | Catches |
 | --- | --- |
-| `app/loading.tsx`, `app/track/loading.tsx` | Nothing — they're the streamed shell, so the page has shape before the query returns |
-| `app/error.tsx` | A page throwing. Offers `reset()`, and prints the digest so a report can be matched to a server log |
-| `app/global-error.tsx` | The **root layout** throwing — where a missing `TURSO_DATABASE_URL` surfaces, since `lib/db.ts` calls `requireEnv` at module evaluation. Inline styles, because the layout that would have loaded the stylesheet is the thing that broke |
+| `src/app/loading.tsx`, `src/app/track/loading.tsx` | Nothing — they're the streamed shell, so the page has shape before the query returns |
+| `src/app/error.tsx` | A page throwing. Offers `reset()`, and prints the digest so a report can be matched to a server log |
+| `src/app/global-error.tsx` | The **root layout** throwing — where a missing `TURSO_DATABASE_URL` surfaces, since `src/lib/db.ts` calls `requireEnv` at module evaluation. Inline styles, because the layout that would have loaded the stylesheet is the thing that broke |
 
 The two interact in a way worth knowing: because `loading.tsx` puts the route in
 a Suspense boundary, the shell flushes immediately and a later failure is
@@ -166,7 +174,7 @@ experience, not just decoration.
 
 ## Discovery
 
-`app/robots.ts` and `app/sitemap.ts`. The sitemap lists the homepage plus every
+`src/app/robots.ts` and `src/app/sitemap.ts`. The sitemap lists the homepage plus every
 non-archived subject with time logged, keyed off `lastAt` for `lastmod`, and is
 regenerated hourly rather than per request — it is read by crawlers, and the
 aggregate behind it reads every row. **It degrades rather than fails**: the
@@ -178,7 +186,7 @@ The admin routes carry `noindex` in their own metadata *and* appear in
 `Disallow` — the meta tag is what actually keeps them out of an index, the
 disallow saves crawl budget.
 
-`app/opengraph-image.tsx` is the share card. `layout.tsx` had declared an
+`src/app/opengraph-image.tsx` is the share card. `layout.tsx` had declared an
 `openGraph` block from the beginning with no image in it, so every share
 rendered as a title beside a blank rectangle. Static and database-free on
 purpose: a live total would cost a full-table aggregate every time any crawler
