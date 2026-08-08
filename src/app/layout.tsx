@@ -16,8 +16,7 @@ import "@fontsource/poppins/latin-400.css";
 import "@fontsource/poppins/latin-500.css";
 import "@fontsource/poppins/latin-600.css";
 import "./globals.css";
-
-const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://hours.justin06lee.dev";
+import { SITE_URL } from "@/lib/site-url";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
@@ -34,6 +33,14 @@ export const metadata: Metadata = {
     locale: "en_US",
     url: SITE_URL,
     siteName: "hours.justin06lee.dev",
+    title: "hours",
+    description: "hours poured into everything, logged honestly",
+  },
+  // Without this a card renders as a small thumbnail beside the text. The
+  // image itself comes from `opengraph-image.tsx` via the file convention —
+  // Next fills in both `og:image` and `twitter:image` from it.
+  twitter: {
+    card: "summary_large_image",
     title: "hours",
     description: "hours poured into everything, logged honestly",
   },
