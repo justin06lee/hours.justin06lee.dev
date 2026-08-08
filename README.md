@@ -183,10 +183,29 @@ a production-only install would otherwise crash before Next ever starts.
 
 ## Fonts
 
-Geist **Mono** only, self-hosted and version-pinned via the `geist` package —
-**not** `next/font/google`. Google refetches at build time, so an upstream
-metrics change would silently shift the mono glyph grid. Same choice as
-justin06lee.dev. See the comment at `src/app/layout.tsx:2-5`.
+Two, both **self-hosted and version-pinned as npm packages**, and neither
+fetched from anyone else's server at build time or at run time:
+
+| Family | Package | Used for |
+| --- | --- | --- |
+| Geist Mono | `geist` | Section kickers, figures, anything on the glyph grid |
+| Poppins 400/500/600 | `@fontsource/poppins` | Body copy — `--font-sans` |
+
+The rule is the same for both, and it is the reason neither uses
+`next/font/google`: an upstream metrics change at an unpinned source ships
+silently to every visitor, and a mono glyph grid or a headline figure shifting
+underfoot is not something you find out about from a build log.
+
+Poppins previously came from `cdn.jsdelivr.net/…/poppins@latest`, written into
+the `@chrome:theme` block by `chrome init` — the same unpinned hazard, plus a
+third-party request on every cold visit. It also declared **weight 400 only**
+while the app renders `font-semibold` in eight places (the homepage headline
+among them) and `font-medium` in one, so those were browser-synthesised fake
+bolds rather than the real cuts. All three weights are now bundled; latin
+subsets only, since nothing here sets devanagari.
+
+**If `chrome init` is ever re-run** it will restore that CDN `@font-face` into
+the fenced block in `globals.css`. Delete it again.
 
 ## Security headers
 

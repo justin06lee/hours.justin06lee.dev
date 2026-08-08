@@ -15,6 +15,7 @@
     "icons:draw": "python3 design/favicon/generate.py > src/app/icon.svg && node scripts/build-icons.mjs"
   },
   "dependencies": {
+    "@fontsource/poppins": "^5.3.0",
     "@libsql/client": "^0.17.4",
     "clsx": "^2.1.1",
     "geist": "^1.7.2",

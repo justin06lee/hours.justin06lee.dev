@@ -3,6 +3,18 @@ import type { Metadata } from "next";
 // next/font/google, matching justin06lee.dev: Google refetches at build time,
 // so an upstream metrics change would silently shift the mono glyph grid.
 import { GeistMono } from "geist/font/mono";
+// Poppins, self-hosted and version-pinned for the same reason Geist is, and
+// replacing a `@latest` CDN URL that `chrome init` had written into
+// globals.css. The latin subsets only — Poppins also ships devanagari, which
+// nothing here sets.
+//
+// Three weights, not one. The CDN declaration covered 400 alone while the app
+// renders `font-semibold` in eight places (the homepage headline among them)
+// and `font-medium` in one, so those were being synthesised by the browser
+// from the regular cut instead of using the real ones.
+import "@fontsource/poppins/latin-400.css";
+import "@fontsource/poppins/latin-500.css";
+import "@fontsource/poppins/latin-600.css";
 import "./globals.css";
 
 const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://hours.justin06lee.dev";

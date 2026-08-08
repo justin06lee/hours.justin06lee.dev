@@ -24,14 +24,20 @@ body {
 }
 
 /* @chrome:theme */
-@font-face {
-  font-family: "Poppins";
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-  src: url("https://cdn.jsdelivr.net/fontsource/fonts/poppins@latest/latin-400-normal.woff2")
-    format("woff2");
-}
+/* Poppins is NOT declared here.
+ *
+ * `chrome init` writes this fenced block with an @font-face pointing at
+ * `cdn.jsdelivr.net/fontsource/fonts/poppins@latest`, and two things were wrong
+ * with it. The `@latest` tag is the same unpinned-upstream hazard the README
+ * rejects next/font/google over for Geist — a metrics change ships silently to
+ * every visitor — and it declared weight 400 only, while this app renders
+ * `font-semibold` in eight places including the headline figure. Every one of
+ * those was a browser-synthesised fake bold rather than real Poppins SemiBold.
+ *
+ * It now comes from the version-pinned `@fontsource/poppins` package, imported
+ * in `src/app/layout.tsx` at 400/500/600. Same reasoning as `geist`, same shape
+ * of fix. If `chrome init` is ever re-run it will restore the CDN @font-face
+ * into this block — delete it again. */
 
 @theme inline {
   --color-background: var(--background);
