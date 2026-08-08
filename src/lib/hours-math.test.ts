@@ -6,6 +6,8 @@ import {
   splitByDay,
   dailyUnion,
   activeYears,
+  resolveYear,
+  yearValues,
   computeStreak,
   formatHours,
   formatElapsed,
@@ -332,6 +334,61 @@ describe("activeYears", () => {
     // splitByDay can emit a zero-length segment exactly on a boundary. Offering
     // that year in the switcher would open the heatmap on an empty grid.
     expect(activeYears({ "2024-01-01": 0, "2026-05-05": H })).toEqual([2026]);
+  });
+});
+
+describe("resolveYear", () => {
+  const YEARS = [2026, 2025, 2024];
+
+  it("defaults to the newest year with data", () => {
+    expect(resolveYear(undefined, YEARS, 2026)).toBe(2026);
+  });
+
+  it("honours a year that actually has data", () => {
+    expect(resolveYear("2024", YEARS, 2026)).toBe(2024);
+  });
+
+  it("falls back for a year with nothing in it", () => {
+    // An old link or a hand-edit. Rendering the empty grid it asked for would
+    // leave the reader with no way to tell "no data" from "broken".
+    expect(resolveYear("2019", YEARS, 2026)).toBe(2026);
+  });
+
+  it("rejects a half-numeric year rather than reading a number out of it", () => {
+    // parseInt("2024abc") is 2024; Number() is NaN. A URL that half-parses is
+    // a URL that silently disagrees with the link that produced it.
+    expect(resolveYear("2024abc", YEARS, 2026)).toBe(2026);
+    expect(resolveYear("banana", YEARS, 2026)).toBe(2026);
+    expect(resolveYear("", YEARS, 2026)).toBe(2026);
+    expect(resolveYear("20244", YEARS, 2026)).toBe(2026);
+    expect(resolveYear("24", YEARS, 2026)).toBe(2026);
+  });
+
+  it("uses the caller's fallback when there is no data at all", () => {
+    expect(resolveYear(undefined, [], 2026)).toBe(2026);
+    expect(resolveYear("2024", [], 2026)).toBe(2026);
+  });
+});
+
+describe("yearValues", () => {
+  const DAILY = {
+    "2024-12-31": 1,
+    "2025-01-01": 2,
+    "2025-06-15": 3,
+    "2026-01-01": 4,
+  };
+
+  it("keeps only the requested year", () => {
+    expect(yearValues(DAILY, 2025)).toEqual({ "2025-01-01": 2, "2025-06-15": 3 });
+  });
+
+  it("returns nothing for a year with no days", () => {
+    expect(yearValues(DAILY, 2019)).toEqual({});
+  });
+
+  it("does not match a year appearing later in the key", () => {
+    // Guards the prefix test: "2024-" must not be found inside "2025-2024".
+    expect(yearValues({ "2025-01-01": 1 }, 2024)).toEqual({});
   });
 });
 

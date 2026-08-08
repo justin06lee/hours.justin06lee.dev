@@ -6,10 +6,17 @@ import { StatTile } from "@/components/chrome/stat-tile";
 import { Streak } from "@/components/chrome/streak";
 import { HoursBarList, HoursHeatmap } from "@/components/hours-charts";
 import { getEntryPage, getHoursOverview, getSubjectBreakdown } from "@/lib/hours";
-import { computeStreak, formatHours, MS_PER_HOUR } from "@/lib/hours-math";
+import {
+  computeStreak,
+  formatHours,
+  MS_PER_HOUR,
+  resolveYear,
+  yearValues,
+} from "@/lib/hours-math";
 import { todayInTz } from "@/lib/calendar-dates";
 import { EntryList } from "@/components/entry-list";
 import { SiteHeader } from "@/components/site-header";
+import { YearNav } from "@/components/year-nav";
 
 export const dynamic = "force-dynamic";
 
@@ -41,11 +48,16 @@ export async function generateMetadata({
 
 export default async function SubjectPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ subject: string }>;
+  searchParams: Promise<{ year?: string }>;
 }) {
-  const { subject: slug } = await params;
-  const overview = await getHoursOverview();
+  const [{ subject: slug }, query, overview] = await Promise.all([
+    params,
+    searchParams,
+    getHoursOverview(),
+  ]);
   const subject = overview.subjects.find((s) => s.id && s.slug === slug);
   if (!subject) notFound();
 
@@ -59,11 +71,15 @@ export default async function SubjectPage({
   ]);
 
   const today = todayInTz(overview.timezone);
-  const year = Number(today.slice(0, 4));
 
   const daily = Object.fromEntries(
     Object.entries(breakdown.daily).map(([d, ms]) => [d, ms / MS_PER_HOUR]),
   );
+  // Scoped to this subject's own years, not the site's: a subject that ran for
+  // one year shouldn't offer three empty ones.
+  const year = resolveYear(query.year, breakdown.years, Number(today.slice(0, 4)));
+  const heatmapMax = Object.values(daily).reduce((m, h) => Math.max(m, h), 1);
+
   const activeDates = new Set(Object.keys(daily).filter((d) => daily[d] > 0));
   const streak = computeStreak(activeDates, today);
 
@@ -153,11 +169,24 @@ export default async function SubjectPage({
         )}
 
         <section className="border-b border-white/10 py-10">
-          <h2 className="mb-5 font-mono text-[11px] uppercase tracking-[0.18em] text-white/40">
-            {year}
-          </h2>
+          <div className="mb-5 flex flex-wrap items-baseline justify-between gap-4">
+            <h2 className="font-mono text-[11px] uppercase tracking-[0.18em] text-white/40">
+              {year}
+            </h2>
+            <YearNav
+              years={breakdown.years}
+              current={year}
+              basePath={`/s/${slug}`}
+              newest={breakdown.years[0] ?? year}
+            />
+          </div>
           <div className="overflow-x-auto">
-            <HoursHeatmap values={daily} year={year} today={today} />
+            <HoursHeatmap
+              values={yearValues(daily, year)}
+              max={heatmapMax}
+              year={year}
+              today={today}
+            />
           </div>
         </section>
 
