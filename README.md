@@ -86,6 +86,7 @@ Put them in `.env.local`. `.gitignore` covers `.env*` but negates
 | `/s/[subject]` | public | One subject: its own total, streak, heatmap and entries |
 | `/track` | admin | The timer console — start/stop lanes, pick subjects |
 | `/track/journal` | admin | Every entry **with its notes**; edit and delete |
+| `/track/subjects` | admin | Add, rename, recolor, archive and delete subjects |
 | `/login` | admin | Same password as justin06lee.dev; this subdomain keeps its own session. `noindex` |
 
 Admin is a session cookie checked server-side. `/track/layout.tsx` gates the
@@ -113,6 +114,22 @@ Edits go through `updateActual`, which writes only the columns a patch names, so
 saving a note cannot move a clock it never mentioned. An entry's end can be set
 but never cleared: clearing it would reopen a finished entry, and no reading of
 "edit this entry" means "start it running again".
+
+### Archiving vs deleting a subject
+
+`/track/subjects` writes to `calendar_categories`, which **the sibling site
+shares**, so it leans on that table's existing constraints rather than inventing
+rules: `UNIQUE(LOWER(name))`, the `is_system` lock on the seeded Sleep row, and
+the in-use check before a delete.
+
+**Archiving is the normal way to retire a subject** — the hours already filed
+under it stay where they are and keep counting, it just stops being offered when
+you start a lane. Deleting is only for a subject that was a mistake, and is
+refused once anything points at it. That refusal matters more than it looks: the
+FK is declared `ON DELETE SET NULL`, but libsql does not enable
+`PRAGMA foreign_keys`, so a delete would not blank the references — it would
+strand them, and every hour filed under that subject would silently become
+uncategorized. The UI only offers delete where it can actually succeed.
 
 ## Scripts
 
