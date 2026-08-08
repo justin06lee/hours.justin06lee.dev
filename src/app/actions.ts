@@ -298,7 +298,7 @@ export async function stopLane(input: {
 }): Promise<LaneResult> {
   await assertAdmin();
 
-  if (!isStringWithin(input.id, MAX_TITLE_LEN) || input.id.length === 0) {
+  if (!isEntryId(input.id)) {
     return { ok: false, error: "missing entry" };
   }
   const patch = stopPatch(input);
@@ -357,7 +357,7 @@ async function runSegments(inputs: SegmentLaneInput[]): Promise<LaneResult> {
   const segments: LaneSegment[] = [];
   let anyResume = false;
   for (const input of inputs) {
-    if (!isStringWithin(input.id, MAX_TITLE_LEN) || input.id.length === 0) {
+    if (!isEntryId(input.id)) {
       return { ok: false, error: "missing entry" };
     }
     // Only `notes` is describable here — the title belongs to the lane, not to

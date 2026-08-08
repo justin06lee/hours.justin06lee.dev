@@ -191,9 +191,19 @@ export default async function SubjectPage({
         </section>
 
         <section className="py-10">
-          <h2 className="mb-5 font-mono text-[11px] uppercase tracking-[0.18em] text-white/40">
-            sessions
-          </h2>
+          <div className="mb-5 flex flex-wrap items-baseline justify-between gap-4">
+            <h2 className="font-mono text-[11px] uppercase tracking-[0.18em] text-white/40">
+              sessions
+            </h2>
+            {/* The stat tile above says how many sessions there are; this list
+                is capped. Saying so is cheaper than letting a reader wonder why
+                counting the rows disagrees with the number. */}
+            {page.total > page.entries.length && (
+              <span className="text-right text-xs text-white/30">
+                latest {page.entries.length} of {page.total}
+              </span>
+            )}
+          </div>
           <EntryList
             entries={page.entries}
             subjects={overview.subjects}

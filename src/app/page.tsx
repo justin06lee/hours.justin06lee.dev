@@ -165,9 +165,16 @@ export default async function HomePage({
         </section>
 
         <section className="py-10">
-          <h2 className="mb-5 font-mono text-[11px] uppercase tracking-[0.18em] text-white/40">
-            recent
-          </h2>
+          <div className="mb-5 flex flex-wrap items-baseline justify-between gap-4">
+            <h2 className="font-mono text-[11px] uppercase tracking-[0.18em] text-white/40">
+              recent
+            </h2>
+            {recent.total > recent.entries.length && (
+              <span className="text-right text-xs text-white/30">
+                latest {recent.entries.length} of {recent.total}
+              </span>
+            )}
+          </div>
           <EntryList
             entries={recent.entries}
             subjects={overview.subjects}
