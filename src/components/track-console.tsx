@@ -12,7 +12,9 @@ import { TimerRing } from "@/components/chrome/timer-ring";
 import { BreakOverlay } from "@/components/chrome/break-overlay";
 import { IntervalPicker } from "@/components/chrome/interval-picker";
 import { ToastProvider, useToast } from "@/components/chrome/toast";
+import { ModalPanel } from "@/components/modal-panel";
 import { useBreakAlarm } from "@/hooks/use-break-alarm";
+import { useLaneSync } from "@/hooks/use-lane-sync";
 import type { CalendarActual } from "@/lib/calendar";
 import type { CalendarCategory } from "@/lib/calendar-categories";
 import { MAX_TRACK, PRIMARY_TRACK } from "@/lib/calendar-constants";
@@ -20,11 +22,6 @@ import { segmentLanes, startLane, startLanes, stopAllLanes, stopLane } from "@/a
 import { cn } from "@/lib/utils";
 
 type Draft = { categoryId: string; title: string };
-
-/** Same selector BreakOverlay traps with — kept identical so the two dialogs
- *  agree on what counts as focusable. */
-const FOCUSABLE =
-  'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
 
 /** What the "what did you do?" dialog collects, per running lane. */
 type Segment = { id: string; track: number; categoryId: string | null; title: string | null };
@@ -126,10 +123,18 @@ function Console({
     [lanes],
   );
 
+  /**
+   * Bumped every time a mutation writes lane state, so the background sync can
+   * tell whether the answer it is holding is still current. See useLaneSync.
+   */
+  const [laneRevision, setLaneRevision] = useState(0);
+
   const apply = useCallback(
     (result: Awaited<ReturnType<typeof startLane>>) => {
-      if (result.ok) setLanes(result.lanes);
-      else toast({ title: result.error, variant: "danger" });
+      if (result.ok) {
+        setLanes(result.lanes);
+        setLaneRevision((n) => n + 1);
+      } else toast({ title: result.error, variant: "danger" });
       return result.ok;
     },
     [toast],
@@ -228,6 +233,29 @@ function Console({
   const alarm = useBreakAlarm(anyRunning, handleAlarm);
 
   /**
+   * Reconcile with the database in the background.
+   *
+   * Paused while the break prompt or the break overlay is up: both hold a
+   * snapshot of the lanes they are about, and swapping the underlying list out
+   * mid-answer would mean answering a different question than the one on
+   * screen. Paused while a mutation is pending too — that request is about to
+   * return authoritative lane state of its own.
+   *
+   * Deliberately does NOT touch the alarm. The rhythm is local to this console:
+   * a lane appearing because it was started on a phone is not a stretch that
+   * began here, and arming a break countdown off someone else's action would be
+   * inventing an intention nobody expressed.
+   */
+  const syncLanes = useCallback((next: CalendarActual[]) => setLanes(next), []);
+
+  useLaneSync({
+    enabled: !prompting && !onBreak && !pending,
+    revision: laneRevision,
+    onLanes: syncLanes,
+    onExpired: onActionFailed,
+  });
+
+  /**
    * Close every prompted lane with its description, then start the break.
    *
    * One Server Action for all of them, not one per lane: this used to be a
@@ -280,76 +308,6 @@ function Console({
     setDescriptions({});
     alarm.acknowledge();
   };
-
-  // Everything `aria-modal` on the dialog below claims but never did, mirroring
-  // BreakOverlay: focus moves in on open and back out on close, Tab is trapped,
-  // escape dismisses, and the page behind stops scrolling.
-  const promptOpen = prompting !== null;
-  const promptRef = useRef<HTMLDivElement>(null);
-  // Element focused before the dialog opened, restored on close.
-  const promptReturnFocus = useRef<HTMLElement | null>(null);
-  // Latest-callback ref so the key handler below subscribes once per opening
-  // rather than once per render — `dismissPrompt` closes over the alarm, which
-  // is a new object every time. Synced in an effect because a ref cannot be
-  // mutated during render, and the handler that reads it only runs after commit.
-  const dismissPromptRef = useRef(dismissPrompt);
-  useEffect(() => {
-    dismissPromptRef.current = dismissPrompt;
-  });
-
-  useEffect(() => {
-    if (!promptOpen) return;
-    promptReturnFocus.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const panel = promptRef.current;
-    const focusables = panel?.querySelectorAll<HTMLElement>(FOCUSABLE);
-    (focusables && focusables.length > 0 ? focusables[0] : panel)?.focus();
-    return () => {
-      promptReturnFocus.current?.focus();
-      promptReturnFocus.current = null;
-    };
-  }, [promptOpen]);
-
-  useEffect(() => {
-    if (!promptOpen) return;
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        dismissPromptRef.current();
-        return;
-      }
-      if (e.key !== "Tab") return;
-      const panel = promptRef.current;
-      if (!panel) return;
-      const focusables = panel.querySelectorAll<HTMLElement>(FOCUSABLE);
-      if (focusables.length === 0) return;
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-      const active = document.activeElement;
-      if (e.shiftKey) {
-        if (active === first || !panel.contains(active)) {
-          e.preventDefault();
-          last?.focus();
-        }
-      } else if (active === last || !panel.contains(active)) {
-        e.preventDefault();
-        first?.focus();
-      }
-    }
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [promptOpen]);
-
-  // Restore the previous value rather than clearing it, so a lock held by
-  // something outer survives ours.
-  useEffect(() => {
-    if (!promptOpen) return;
-    const previous = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.body.style.overflow = previous;
-    };
-  }, [promptOpen]);
 
   /**
    * Break over: reopen every lane that was running before it.
@@ -644,25 +602,16 @@ function Console({
         </section>
       </div>
 
-      {/* "what did you do?" — asked before anything is written. */}
-      {prompting && (
-        <div
-          // mousedown, not click: a drag that starts inside the panel and ends
-          // on the backdrop (selecting text in a textarea) fires click here,
-          // and losing what was typed to that is exactly the wrong outcome.
-          onMouseDown={(e) => {
-            if (e.target === e.currentTarget) dismissPrompt();
-          }}
-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/80 p-4"
-        >
-          <div
-            ref={promptRef}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="segment-title"
-            tabIndex={-1}
-            className="max-h-[85dvh] w-full max-w-lg overflow-y-auto border border-white/20 bg-[#0a0a0a] p-6"
-          >
+      {/* "what did you do?" — asked before anything is written. The focus trap,
+          escape handling, backdrop dismiss and scroll lock all live in
+          ModalPanel, which the journal's editor shares. */}
+      <ModalPanel
+        open={prompting !== null}
+        onClose={dismissPrompt}
+        labelledBy="segment-title"
+      >
+        {prompting && (
+          <>
             <h2
               id="segment-title"
               className="font-mono text-[11px] uppercase tracking-[0.18em] text-white/40"
@@ -712,9 +661,9 @@ function Console({
                 log it and break
               </Button>
             </div>
-          </div>
-        </div>
-      )}
+          </>
+        )}
+      </ModalPanel>
 
       <BreakOverlay
         open={onBreak}
