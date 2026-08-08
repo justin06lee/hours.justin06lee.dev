@@ -84,12 +84,35 @@ Put them in `.env.local`. `.gitignore` covers `.env*` but negates
 | --- | --- | --- |
 | `/` | public | Overview — total hours, streak, per-subject bars, heatmap, recent entries |
 | `/s/[subject]` | public | One subject: its own total, streak, heatmap and entries |
-| `/track` | admin | The timer console — start/stop lanes, pick subjects. `noindex` |
+| `/track` | admin | The timer console — start/stop lanes, pick subjects |
+| `/track/journal` | admin | Every entry **with its notes**; edit and delete |
 | `/login` | admin | Same password as justin06lee.dev; this subdomain keeps its own session. `noindex` |
 
-Admin is a session cookie checked server-side; `/track` redirects to `/login`
-when absent, and `/login` redirects to `/track` when present. Every view is
-`force-dynamic` — the whole point is the number moving while a timer runs.
+Admin is a session cookie checked server-side. `/track/layout.tsx` gates the
+whole subtree and declares `noindex` for it, **and every page under it checks
+again** — there is no middleware in this app, layouts and pages are separate
+server entry points, and a layout gate has never been what stops a page's data
+fetch from running. `isAdminServer` is `cache()`d per request, so the second
+check costs nothing. `/login` redirects to `/track` when a session is present.
+
+Every view is `force-dynamic` — the whole point is the number moving while a
+timer runs.
+
+### The journal
+
+The console can only start and stop. `/track/journal` is the other half:
+
+- it is the **only** place the `notes` written by the break prompt are read
+  back. Before it existed, "what did you get done?" was asked every 50 minutes
+  and never answered to anyone;
+- it is the **repair** surface — a lane left running overnight, a subject
+  picked wrong, a start that needs moving. `?notes=1` filters to the entries
+  that actually carry a reflection.
+
+Edits go through `updateActual`, which writes only the columns a patch names, so
+saving a note cannot move a clock it never mentioned. An entry's end can be set
+but never cleared: clearing it would reopen a finished entry, and no reading of
+"edit this entry" means "start it running again".
 
 ## Scripts
 

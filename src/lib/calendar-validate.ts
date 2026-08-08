@@ -39,6 +39,19 @@ export function isStringWithin(v: unknown, max: number): v is string {
 }
 
 /**
+ * Upper bound on a row id. Ids are `crypto.randomUUID()` (36 chars) today, so
+ * this is slack rather than a format check — the point is that an id arriving
+ * from a client is a bounded string before it reaches a query, not that it
+ * matches any particular shape. A wrong-but-well-formed id finds no row and is
+ * reported as not-found, which is the correct answer either way.
+ */
+export const MAX_ID_LEN = 64;
+
+export function isEntryId(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0 && v.length <= MAX_ID_LEN;
+}
+
+/**
  * Largest page a list query will serve. Bounds `?per=`-style input so a crafted
  * query string can't ask for the whole table back through a paginated surface.
  */
