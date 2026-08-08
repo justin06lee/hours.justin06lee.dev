@@ -13,18 +13,28 @@ import {
 } from "@/lib/auth";
 import { isAdminServer } from "@/lib/auth-server";
 import {
+  deleteActual,
   getRunningActuals,
   segmentActuals,
   startActual,
   startActuals,
   stopAllActuals,
+  updateActual,
+  type ActualPatch,
   type CalendarActual,
   type LaneResume,
   type LaneSegment,
   type SegmentActualsResult,
+  type UpdateActualResult,
 } from "@/lib/calendar";
 import { MAX_TRACK, PRIMARY_TRACK, isValidTrack } from "@/lib/calendar-constants";
-import { MAX_NOTES_LEN, MAX_TITLE_LEN, isStringWithin } from "@/lib/calendar-validate";
+import {
+  MAX_NOTES_LEN,
+  MAX_TITLE_LEN,
+  isEntryId,
+  isFiniteEpochMs,
+  isStringWithin,
+} from "@/lib/calendar-validate";
 import { getSiteConfig, resolveTimezone } from "@/lib/site-config";
 
 /**
@@ -49,6 +59,8 @@ async function assertAdmin() {
 function revalidateAll() {
   revalidatePath("/");
   revalidatePath("/track");
+  revalidatePath("/track/journal");
+  revalidatePath("/track/subjects");
   revalidatePath("/s/[subject]", "page");
 }
 
@@ -371,4 +383,137 @@ async function runSegments(inputs: SegmentLaneInput[]): Promise<LaneResult> {
 export async function refreshLanes(): Promise<CalendarActual[]> {
   await assertAdmin();
   return getRunningActuals();
+}
+
+/* ── Editing what was already logged ───────────────────────────────────────
+ *
+ * The console can only ever start and stop. Everything below is the repair
+ * path: a lane left running overnight, a subject picked wrong, a description
+ * worth rewriting. It writes through `updateActual`, which touches only the
+ * columns a patch actually names and refuses a patch computed against a row
+ * that has since moved — so a save from a stale journal tab reports a conflict
+ * rather than overwriting whatever happened in between.
+ */
+
+export type EntryResult = { ok: true } | { ok: false; error: string };
+
+/**
+ * What the journal's editor may change.
+ *
+ * `endAt` is deliberately `number` and not `number | null`. Writing null would
+ * *reopen* a finished entry — the exact resurrection `updateActual`'s SET-list
+ * narrowing exists to prevent — and there is no reading of "edit this entry" in
+ * which the answer is "start it running again". Stopping a running entry is a
+ * concrete end time; that is available, and it is the only thing this offers.
+ */
+export type EntryPatchInput = {
+  id: string;
+  categoryId?: string | null;
+  title?: string | null;
+  notes?: string | null;
+  startAt?: number;
+  endAt?: number;
+};
+
+/** Every reason `updateActual` can refuse, so a new one becomes a compile
+ *  error here rather than a silent fallthrough to a generic message. */
+type UpdateFailureReason = Extract<UpdateActualResult, { ok: false }>["reason"];
+
+function updateError(reason: UpdateFailureReason): string {
+  switch (reason) {
+    case "not-found":
+      return "that entry no longer exists";
+    case "start-after-end":
+      return "the end has to come after the start";
+    case "would-overlap-running":
+      return "that would collide with a lane that's still running";
+    case "invalid-category":
+      return "that subject no longer exists";
+    case "conflict":
+      // Not a failure so much as "you were looking at an old copy". Say what
+      // to do about it, because the fix is not obvious from the word alone.
+      return "that entry changed somewhere else — reload and try again";
+  }
+}
+
+/**
+ * Edits one logged entry.
+ *
+ * Only the fields the caller actually sends are written: "not provided" stays
+ * distinguishable from "explicitly cleared" all the way down to the SET list,
+ * so saving a note cannot move a clock it never mentioned.
+ */
+export async function updateEntry(input: EntryPatchInput): Promise<EntryResult> {
+  await assertAdmin();
+
+  if (!isEntryId(input.id)) return { ok: false, error: "missing entry" };
+
+  const patch: ActualPatch = {};
+
+  if (input.categoryId !== undefined) {
+    // An empty string is the "no subject" option in the select, which means
+    // uncategorized — a real choice, and distinct from not touching the field.
+    if (input.categoryId !== null && !isEntryId(input.categoryId)) {
+      return { ok: false, error: "that subject no longer exists" };
+    }
+    patch.categoryId = input.categoryId || null;
+  }
+
+  if (input.title !== undefined) {
+    if (!isStringWithin(input.title ?? "", MAX_TITLE_LEN)) {
+      return { ok: false, error: "title too long" };
+    }
+    patch.title = input.title?.trim() || null;
+  }
+
+  if (input.notes !== undefined) {
+    if (!isStringWithin(input.notes ?? "", MAX_NOTES_LEN)) {
+      return { ok: false, error: "notes too long" };
+    }
+    patch.notes = input.notes?.trim() || null;
+  }
+
+  // Bounded to years 2001–2100. The client parses its datetime-local input with
+  // `localInputToEpoch`, which returns NaN rather than throwing on a malformed
+  // value — so an unparseable box arrives here as NaN and has to be rejected
+  // before it reaches a column every total is derived from.
+  if (input.startAt !== undefined) {
+    if (!isFiniteEpochMs(input.startAt)) return { ok: false, error: "that start time isn't valid" };
+    patch.startAt = input.startAt;
+  }
+  if (input.endAt !== undefined) {
+    if (!isFiniteEpochMs(input.endAt)) return { ok: false, error: "that end time isn't valid" };
+    patch.endAt = input.endAt;
+  }
+
+  if (Object.keys(patch).length === 0) return { ok: true };
+
+  // `hydrate: false` — the journal re-reads the page after a save, so the
+  // read-back would be thrown away.
+  const result = await updateActual(input.id, patch, { hydrate: false });
+  if (!result.ok) return { ok: false, error: updateError(result.reason) };
+
+  revalidateAll();
+  return { ok: true };
+}
+
+/**
+ * Deletes one logged entry outright.
+ *
+ * Genuinely destructive and genuinely necessary: a lane started by mistake has
+ * no other way out, and leaving it in would corrupt every total that reads it.
+ * The journal confirms before calling this.
+ */
+export async function deleteEntry(input: { id: string }): Promise<EntryResult> {
+  await assertAdmin();
+  if (!isEntryId(input.id)) return { ok: false, error: "missing entry" };
+
+  // The result is deliberately ignored. `deleteActual` reports whether a row
+  // was actually removed, and a miss means somebody else already deleted it —
+  // the caller wanted the row gone and the row is gone, so that is a successful
+  // no-op rather than an error to show anyone.
+  await deleteActual(input.id);
+
+  revalidateAll();
+  return { ok: true };
 }
