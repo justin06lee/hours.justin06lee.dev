@@ -105,6 +105,14 @@ grid rather than on twelve empty months. The shading ceiling is computed across
 *all* years and passed in explicitly, so switching years doesn't renormalize the
 colours and a quiet year renders quiet.
 
+The console reconciles with the database every 30 seconds while its tab is
+visible, and immediately on the way back to it. That matters because the
+database is shared: a lane started on justin06lee.dev, on a phone, or in another
+tab was previously invisible here until a manual reload, and the console would
+offer a "start" button for a lane something else already held. A poll whose
+answer is older than a mutation the client has since made is discarded rather
+than applied — see the revision note in `use-lane-sync.ts`.
+
 ### The journal
 
 The console can only start and stop. `/track/journal` is the other half:
