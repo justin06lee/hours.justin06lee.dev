@@ -125,6 +125,49 @@ export function splitByDay(
   return out;
 }
 
+/**
+ * Per-day union ms for a set of intervals, keyed "YYYY-MM-DD" in the given zone.
+ *
+ * Every heatmap on the site is produced by this one function — the site-wide
+ * one and the per-subject one — so the two cannot disagree about what a day is
+ * worth. Spans are split at local midnight first, then unioned *within* each
+ * day, which is the pair of rules that makes a cell honest: a 23:00–01:00
+ * session lands on both days rather than dumping its whole duration on the day
+ * it started, and two parallel lanes on one afternoon don't paint that day
+ * twice as dense as it was.
+ */
+export function dailyUnion(
+  intervals: readonly Interval[],
+  timezone: string,
+): Record<string, number> {
+  const perDay = new Map<string, Interval[]>();
+  for (const interval of intervals) {
+    for (const seg of splitByDay(interval, timezone)) {
+      if (!perDay.has(seg.date)) perDay.set(seg.date, []);
+      perDay.get(seg.date)!.push({ start: seg.start, end: seg.end });
+    }
+  }
+  const daily: Record<string, number> = {};
+  for (const [date, spans] of perDay) daily[date] = unionMs(spans);
+  return daily;
+}
+
+/**
+ * Every calendar year with time actually logged in it, newest first.
+ *
+ * Drives the heatmap's year switcher, so the rule it encodes is "offer a year
+ * only if there is something to see there". Days present in the map but worth
+ * zero don't qualify — `splitByDay` can emit a zero-length segment at a
+ * boundary, and a year offered for one of those would open on an empty grid.
+ */
+export function activeYears(daily: Record<string, number>): number[] {
+  const years = new Set<number>();
+  for (const [date, ms] of Object.entries(daily)) {
+    if (ms > 0) years.add(Number(date.slice(0, 4)));
+  }
+  return [...years].sort((a, b) => b - a);
+}
+
 export type StreakSummary = {
   current: number;
   best: number;

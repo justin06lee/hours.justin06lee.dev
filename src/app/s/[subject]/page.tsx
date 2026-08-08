@@ -5,13 +5,16 @@ import { ArrowLeft } from "lucide-react";
 import { StatTile } from "@/components/chrome/stat-tile";
 import { Streak } from "@/components/chrome/streak";
 import { HoursBarList, HoursHeatmap } from "@/components/hours-charts";
-import { getHoursOverview } from "@/lib/hours";
-import { computeStreak, formatHours, MS_PER_HOUR, splitByDay, unionMs } from "@/lib/hours-math";
+import { getEntryPage, getHoursOverview, getSubjectBreakdown } from "@/lib/hours";
+import { computeStreak, formatHours, MS_PER_HOUR } from "@/lib/hours-math";
 import { todayInTz } from "@/lib/calendar-dates";
 import { EntryList } from "@/components/entry-list";
 import { SiteHeader } from "@/components/site-header";
 
 export const dynamic = "force-dynamic";
+
+/** How many of the subject's sessions the page lists. */
+const SESSION_LIMIT = 50;
 
 export async function generateMetadata({
   params,
@@ -46,38 +49,35 @@ export default async function SubjectPage({
   const subject = overview.subjects.find((s) => s.id && s.slug === slug);
   if (!subject) notFound();
 
-  const entries = overview.entries.filter((e) => e.categoryId === subject.id);
+  // The subject's own history, and one bounded page of its entries. Both are
+  // scoped to this category in SQL rather than filtered out of a full-table
+  // read in JS, so a busy subject costs its own rows and a quiet one costs
+  // almost nothing.
+  const [breakdown, page] = await Promise.all([
+    getSubjectBreakdown(subject.id!, overview.timezone),
+    getEntryPage({ categoryId: subject.id, limit: SESSION_LIMIT }),
+  ]);
+
   const today = todayInTz(overview.timezone);
   const year = Number(today.slice(0, 4));
 
-  // Per-day density for this subject only.
-  const perDay = new Map<string, { start: number; end: number }[]>();
-  for (const e of entries) {
-    for (const seg of splitByDay({ start: e.startAt, end: e.endAt }, overview.timezone)) {
-      if (!perDay.has(seg.date)) perDay.set(seg.date, []);
-      perDay.get(seg.date)!.push({ start: seg.start, end: seg.end });
-    }
-  }
-  const daily: Record<string, number> = {};
-  for (const [date, intervals] of perDay) daily[date] = unionMs(intervals) / MS_PER_HOUR;
-
+  const daily = Object.fromEntries(
+    Object.entries(breakdown.daily).map(([d, ms]) => [d, ms / MS_PER_HOUR]),
+  );
   const activeDates = new Set(Object.keys(daily).filter((d) => daily[d] > 0));
   const streak = computeStreak(activeDates, today);
 
   // Break the subject down by what was actually written in the title — this is
   // where "machine learning" and "cybersecurity" live, since categories are
-  // broader buckets than the thing you were really doing.
-  const byTitle = new Map<string, { ms: number; count: number }>();
-  for (const e of entries) {
-    const key = (e.title ?? "").trim().toLowerCase() || "(untitled)";
-    const cur = byTitle.get(key) ?? { ms: 0, count: 0 };
-    cur.ms += e.endAt - e.startAt;
-    cur.count++;
-    byTitle.set(key, cur);
-  }
-  const titleBars = [...byTitle.entries()]
-    .map(([label, v]) => ({ id: label, label, value: v.ms / MS_PER_HOUR, color: subject.color }))
-    .sort((a, b) => b.value - a.value);
+  // broader buckets than the thing you were really doing. The union happens in
+  // getSubjectBreakdown, so these bars obey the same counting rule as the
+  // headline above them.
+  const titleBars = breakdown.titles.map((t) => ({
+    id: t.label,
+    label: t.label,
+    value: t.ms / MS_PER_HOUR,
+    color: subject.color,
+  }));
 
   const daysActive = activeDates.size;
 
@@ -166,7 +166,7 @@ export default async function SubjectPage({
             sessions
           </h2>
           <EntryList
-            entries={entries.slice(0, 50)}
+            entries={page.entries}
             subjects={overview.subjects}
             timezone={overview.timezone}
           />

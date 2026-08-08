@@ -38,6 +38,42 @@ export function isStringWithin(v: unknown, max: number): v is string {
   return typeof v === "string" && v.length <= max;
 }
 
+/**
+ * Largest page a list query will serve. Bounds `?per=`-style input so a crafted
+ * query string can't ask for the whole table back through a paginated surface.
+ */
+export const MAX_PAGE_SIZE = 200;
+
+/**
+ * Clamps a page size to [1, MAX_PAGE_SIZE], falling back to `fallback` for
+ * anything that isn't a usable number. Total by construction: NaN, Infinity,
+ * negatives, zero and fractions all resolve rather than reaching SQL, because
+ * `LIMIT -1` in SQLite means *no limit* — the one value that would silently
+ * undo the bound this exists to enforce.
+ */
+export function clampPageLimit(limit: unknown, fallback = 20): number {
+  const n = typeof limit === "number" ? limit : Number(limit);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(MAX_PAGE_SIZE, Math.floor(n));
+}
+
+/** Clamps a row offset to a non-negative integer. Junk resolves to 0. */
+export function clampPageOffset(offset: unknown): number {
+  const n = typeof offset === "number" ? offset : Number(offset);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.floor(n);
+}
+
+/**
+ * Turns a 1-based `?page=` parameter into a row offset, given a page size.
+ * Anything unparseable is page 1.
+ */
+export function pageToOffset(page: unknown, pageSize: number): number {
+  const n = typeof page === "number" ? page : Number(page);
+  if (!Number.isFinite(n) || n < 1) return 0;
+  return (Math.floor(n) - 1) * pageSize;
+}
+
 /** Per-plan max — generous enough for "I planned X but might do any of {a,b,c,d,…}",
  *  tight enough that a runaway client can't blow up the JSON column. */
 export const MAX_FALLBACKS = 16;
