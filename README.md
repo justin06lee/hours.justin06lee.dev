@@ -145,6 +145,45 @@ FK is declared `ON DELETE SET NULL`, but libsql does not enable
 strand them, and every hour filed under that subject would silently become
 uncategorized. The UI only offers delete where it can actually succeed.
 
+## When it breaks
+
+Every route is `force-dynamic` and opens by talking to Turso, so "the database
+is briefly unreachable" is not a hypothetical failure mode — it is *the* failure
+mode. Three files cover it:
+
+| File | Catches |
+| --- | --- |
+| `app/loading.tsx`, `app/track/loading.tsx` | Nothing — they're the streamed shell, so the page has shape before the query returns |
+| `app/error.tsx` | A page throwing. Offers `reset()`, and prints the digest so a report can be matched to a server log |
+| `app/global-error.tsx` | The **root layout** throwing — where a missing `TURSO_DATABASE_URL` surfaces, since `lib/db.ts` calls `requireEnv` at module evaluation. Inline styles, because the layout that would have loaded the stylesheet is the thing that broke |
+
+The two interact in a way worth knowing: because `loading.tsx` puts the route in
+a Suspense boundary, the shell flushes immediately and a later failure is
+streamed to the client as a boundary error (React's `$RX`), which renders
+`error.tsx` in place. Without the loading file the same failure produces a bare
+500 document instead. The loading states are load-bearing for the error
+experience, not just decoration.
+
+## Discovery
+
+`app/robots.ts` and `app/sitemap.ts`. The sitemap lists the homepage plus every
+non-archived subject with time logged, keyed off `lastAt` for `lastmod`, and is
+regenerated hourly rather than per request — it is read by crawlers, and the
+aggregate behind it reads every row. **It degrades rather than fails**: the
+build prerenders this route, so an unreachable database would otherwise break a
+deploy over a file crawlers read once an hour; it falls back to the homepage
+alone and logs why.
+
+The admin routes carry `noindex` in their own metadata *and* appear in
+`Disallow` — the meta tag is what actually keeps them out of an index, the
+disallow saves crawl budget.
+
+`app/opengraph-image.tsx` is the share card. `layout.tsx` had declared an
+`openGraph` block from the beginning with no image in it, so every share
+rendered as a title beside a blank rectangle. Static and database-free on
+purpose: a live total would cost a full-table aggregate every time any crawler
+re-fetched it, for a number nobody reads off a thumbnail.
+
 ## Scripts
 
 | Script | Does |
