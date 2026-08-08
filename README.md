@@ -99,6 +99,12 @@ check costs nothing. `/login` redirects to `/track` when a session is present.
 Every view is `force-dynamic` — the whole point is the number moving while a
 timer runs.
 
+Both heatmaps take `?year=`, offering only years that actually have data and
+defaulting to the newest of them — so on Jan 2nd the page opens on last year's
+grid rather than on twelve empty months. The shading ceiling is computed across
+*all* years and passed in explicitly, so switching years doesn't renormalize the
+colours and a quiet year renders quiet.
+
 ### The journal
 
 The console can only start and stop. `/track/journal` is the other half:

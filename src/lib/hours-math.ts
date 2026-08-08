@@ -168,6 +168,51 @@ export function activeYears(daily: Record<string, number>): number[] {
   return [...years].sort((a, b) => b - a);
 }
 
+/**
+ * Which year a heatmap should show, given what the URL asked for.
+ *
+ * The rule is "the newest year with data, unless the reader asked for another
+ * one that also has data". A `?year=` naming a year with nothing in it — a typo,
+ * an old link, a hand-edit — falls back rather than rendering an empty grid the
+ * reader has no way to interpret. `fallback` covers the site with no entries at
+ * all, where there is no newest year to fall back to.
+ */
+export function resolveYear(
+  requested: string | undefined,
+  years: readonly number[],
+  fallback: number,
+): number {
+  const newest = years.length > 0 ? years[0] : fallback;
+  if (requested === undefined) return newest;
+  // Deliberately strict: `Number("2026abc")` is NaN, but `parseInt` would
+  // happily read 2026 out of it, and a URL that half-parses is a URL that
+  // silently disagrees with the link that produced it.
+  const asked = /^\d{4}$/.test(requested) ? Number(requested) : NaN;
+  return years.includes(asked) ? asked : newest;
+}
+
+/**
+ * The days of one calendar year, out of a map spanning all of them.
+ *
+ * Kept separate from the intensity ceiling on purpose. The heatmap scales its
+ * shading against the busiest day it is given, so slicing the values without
+ * pinning `max` would renormalize every year to its own maximum — a quiet year
+ * would render exactly as dark as a relentless one, and the grid would stop
+ * meaning anything across years. Callers pass this as `values` and the
+ * all-years maximum as `max`.
+ */
+export function yearValues(
+  daily: Record<string, number>,
+  year: number,
+): Record<string, number> {
+  const prefix = `${year}-`;
+  const out: Record<string, number> = {};
+  for (const [date, value] of Object.entries(daily)) {
+    if (date.startsWith(prefix)) out[date] = value;
+  }
+  return out;
+}
+
 export type StreakSummary = {
   current: number;
   best: number;

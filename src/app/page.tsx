@@ -3,10 +3,17 @@ import { Streak } from "@/components/chrome/streak";
 import { HoursBarList, HoursHeatmap } from "@/components/hours-charts";
 import { FadeIn } from "@/components/chrome/fade-in";
 import { getEntryPage, getHoursOverview } from "@/lib/hours";
-import { computeStreak, formatHours, MS_PER_HOUR } from "@/lib/hours-math";
+import {
+  computeStreak,
+  formatHours,
+  MS_PER_HOUR,
+  resolveYear,
+  yearValues,
+} from "@/lib/hours-math";
 import { todayInTz } from "@/lib/calendar-dates";
 import { EntryList } from "@/components/entry-list";
 import { SiteHeader } from "@/components/site-header";
+import { YearNav } from "@/components/year-nav";
 
 // Every view is live: the whole point is the number moving while a timer runs.
 export const dynamic = "force-dynamic";
@@ -19,18 +26,34 @@ export const metadata = { alternates: { canonical: "/" } };
 /** How many entries the homepage's "recent" section shows. */
 const RECENT_LIMIT = 20;
 
-export default async function HomePage() {
+export default async function HomePage({
+  searchParams,
+}: {
+  searchParams: Promise<{ year?: string }>;
+}) {
   // Concurrent rather than sequential: the aggregate and the recent page are
   // independent queries against the same snapshot-free read, and neither needs
   // the other's result. Both take their "now" from the request-scoped
   // `requestNow()`, so a running entry is clamped to the same instant in the
   // headline total and in the list beneath it.
-  const [overview, recent] = await Promise.all([
+  const [params, overview, recent] = await Promise.all([
+    searchParams,
     getHoursOverview(),
     getEntryPage({ limit: RECENT_LIMIT }),
   ]);
   const today = todayInTz(overview.timezone);
-  const year = Number(today.slice(0, 4));
+  // The heatmap's year, not necessarily this one: after Jan 1 a site with no
+  // entries yet this year would otherwise open on an empty grid with last
+  // year's work nowhere to be seen.
+  const year = resolveYear(params.year, overview.years, Number(today.slice(0, 4)));
+  // Scaled against the busiest day of *all* years, so a quiet year renders
+  // quiet instead of being renormalized to look like a relentless one.
+  // Reduced rather than spread into Math.max, matching the caution elsewhere
+  // in this codebase about one-argument-per-element calls.
+  const heatmapMax = Object.values(overview.daily).reduce(
+    (m, ms) => Math.max(m, ms / MS_PER_HOUR),
+    1,
+  );
 
   const activeDates = new Set(Object.keys(overview.daily).filter((d) => overview.daily[d] > 0));
   const streak = computeStreak(activeDates, today);
@@ -115,14 +138,26 @@ export default async function HomePage() {
         </section>
 
         <section className="border-b border-white/10 py-10">
-          <h2 className="mb-5 font-mono text-[11px] uppercase tracking-[0.18em] text-white/40">
-            {year}
-          </h2>
+          <div className="mb-5 flex flex-wrap items-baseline justify-between gap-4">
+            <h2 className="font-mono text-[11px] uppercase tracking-[0.18em] text-white/40">
+              {year}
+            </h2>
+            <YearNav
+              years={overview.years}
+              current={year}
+              basePath="/"
+              newest={overview.years[0] ?? year}
+            />
+          </div>
           <div className="overflow-x-auto">
             <HoursHeatmap
               values={Object.fromEntries(
-                Object.entries(overview.daily).map(([d, ms]) => [d, ms / MS_PER_HOUR]),
+                Object.entries(yearValues(overview.daily, year)).map(([d, ms]) => [
+                  d,
+                  ms / MS_PER_HOUR,
+                ]),
               )}
+              max={heatmapMax}
               year={year}
               today={today}
             />

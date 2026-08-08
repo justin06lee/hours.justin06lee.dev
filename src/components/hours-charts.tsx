@@ -34,17 +34,27 @@ export function HoursHeatmap({
   values,
   year,
   today,
+  max,
 }: {
-  /** Hours per day, keyed "YYYY-MM-DD". */
+  /** Hours per day, keyed "YYYY-MM-DD". One year's worth. */
   values: Record<string, number>;
   year: number;
   today: string;
+  /**
+   * Intensity ceiling. Passed explicitly — and computed across *every* year,
+   * not just the one being rendered — so switching years doesn't renormalize
+   * the shading. Left to its default, Heatmap scales against the busiest day it
+   * was handed, which would make a quiet year look exactly as dark as a
+   * relentless one and stop the grid meaning anything across years.
+   */
+  max?: number;
 }) {
   return (
     <Heatmap
       values={values}
       year={year}
       today={today}
+      max={max}
       title={(date, value) =>
         value > 0 ? `${date} — ${value.toFixed(1)}h` : `${date} — nothing`
       }
