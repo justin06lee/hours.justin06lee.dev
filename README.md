@@ -93,6 +93,7 @@ Put them in `.env.local`. `.gitignore` covers `.env*` but negates
 | `/` | public | Overview — total hours, streak, per-subject bars, heatmap, recent entries |
 | `/s/[subject]` | public | One subject: its own total, streak, heatmap and entries |
 | `/track` | admin | The timer console — start/stop lanes, pick subjects |
+| `/track/schedule` | admin | What the schedule engine resolves today and tomorrow to. Read-only |
 | `/track/journal` | admin | Every entry **with its notes**; edit and delete |
 | `/track/subjects` | admin | Add, rename, recolor, archive and delete subjects |
 | `/login` | admin | Same password as justin06lee.dev; this subdomain keeps its own session. `noindex` |
@@ -120,6 +121,54 @@ tab was previously invisible here until a manual reload, and the console would
 offer a "start" button for a lane something else already held. A poll whose
 answer is older than a mutation the client has since made is discarded rather
 than applied — see the revision note in `use-lane-sync.ts`.
+
+## The schedule
+
+**It is not a timetable — it's a rule engine over the sun.** Prayer times move
+by nearly four hours across the year at this latitude, so there is no "Monday
+looks like this". There is a set of activities with target durations and
+anchors, resolved fresh for each date.
+
+Edit `src/lib/schedule/rules.ts` to change your life. Everything else under
+`src/lib/schedule/` is the engine, and none of it knows what a "workout" is.
+
+**Prayer times are computed, not fetched** (`src/lib/prayer-times.ts`, via the
+`adhan` package). The shared `prayer_times_cache` the sibling site fills is
+deliberately not read: it stores no **sunrise**, which the sleep rule needs
+twice, and a monthly cache cannot answer for an arbitrary past date (to backfill
+a log) or a future one (to show tomorrow). Locally computed times agree with
+that cache to within 1–2 minutes, which is nothing against 15-minute rules.
+
+### The sleep rule
+
+1. Bed at Isha + 15 min, but never before **20:30**. Without that floor,
+   December's 18:10 Isha would set bedtime at 18:25 and — via rule 2 — the alarm
+   for **03:25**.
+2. Sleep 9 hours. A target *and* a ceiling.
+3. If 9 hours won't fit before sunrise, don't shorten the night — **split it**.
+   Up at Fajr − 15 for tahajjud and Fajr, then back down for the remainder.
+   Since the night is being interrupted anyway, it may as well be for the prayer.
+
+### Everything else is fitted around it
+
+Evening windows own their spans outright (Asr→Maghrib, Maghrib→**bedtime** — the
+latter matters in winter, where anchoring to Isha would leave two hours
+unassigned). Prayers are *carved out* of whatever block is running, so a block
+spanning Dhuhr is split by it rather than overlapping it — which is how
+"30 minutes after Dhuhr" falls out of the model instead of being a special case.
+
+Waking to Asr is then divided between the morning blocks. **The targets total 25
+hours on purpose**, so every day gives something back: the workout is fixed and
+the two six-hour work blocks are elastic, absorbing the entire shortfall. In
+practice they land near 4h each rather than 6h, which is why `/track/schedule`
+prints target against realised — the compression should be visible, not
+discovered from a total that looks wrong months later.
+
+The engine is pure: given prayer times and a ruleset it returns the same day
+every time, with no clock, database or environment involved. That is what lets
+it be tested against 122 real days a year, asserting that each one is covered
+completely with no gaps or overlaps, sleeps exactly 9 hours, keeps the workout at
+exactly an hour, and never schedules an activity during a prayer.
 
 ### The journal
 
