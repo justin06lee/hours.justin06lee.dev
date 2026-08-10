@@ -332,13 +332,30 @@ describe("resolveDay — invariants that must hold on every day of the year", ()
     }
   });
 
-  it("holds the elastic blocks above their floor", () => {
+  it("holds the elastic work blocks above their floor", () => {
     for (const date of dates) {
       const d = day(date);
-      for (const c of d.compression) {
-        if (c.id === "workout") continue;
-        expect(c.actualMs, `${date}: ${c.id}`).toBeGreaterThanOrEqual(90 * MIN);
+      // Scoped to the two elastic sequence blocks. The evening windows are in
+      // `compression` for the readout but take whatever their prayer window
+      // gives them, and a short March evening legitimately falls under an hour.
+      for (const id of ["deep-work", "projects"]) {
+        const c = d.compression.find((x) => x.id === id)!;
+        expect(c.actualMs, `${date}: ${id}`).toBeGreaterThanOrEqual(90 * MIN);
       }
+    }
+  });
+
+  it("never gives islamic study more than its two-hour cap, and ends it at maghrib", () => {
+    for (const date of dates) {
+      const d = day(date);
+      const islam = d.compression.find((c) => c.id === "islam")!;
+      expect(islam.actualMs, `${date}`).toBeLessThanOrEqual(2 * HOUR);
+
+      const blocks = d.blocks.filter((b) => b.title === "islamic history, hadith, quran");
+      expect(blocks.length, `${date}`).toBeGreaterThan(0);
+      expect(blocks[blocks.length - 1].end, `${date}: ends at maghrib`).toBe(
+        d.prayers.maghrib,
+      );
     }
   });
 
@@ -360,9 +377,11 @@ describe("resolveDay — the days worth eyeballing", () => {
     expect(d.lastNight.shape).toBe("split");
     expect(d.tonight.flooredBedtime).toBe(false);
 
-    const work = d.compression.filter((c) => c.id !== "workout");
     // 13h of targets into a day that cannot hold them.
-    for (const c of work) expect(c.actualMs).toBeLessThan(c.targetMs);
+    for (const id of ["deep-work", "projects"]) {
+      const c = d.compression.find((x) => x.id === id)!;
+      expect(c.actualMs).toBeLessThan(c.targetMs);
+    }
   });
 
   it("midwinter: the floor holds bedtime at 20:30 and wake at 05:30", () => {
@@ -398,8 +417,11 @@ describe("resolveDay — the days worth eyeballing", () => {
     const journal = d.blocks.filter((b) => b.title === "no screens, journal");
     expect(islam.length).toBeGreaterThan(0);
     expect(journal.length).toBeGreaterThan(0);
-    // Islamic study opens once Asr has been prayed.
-    expect(islam[0].start).toBe(d.prayers.asr + RULESET.prayerGaps.asr);
+    // Capped at two hours and anchored to Maghrib, so it opens two hours before
+    // Maghrib rather than the moment Asr has been prayed. The stretch between
+    // Asr and that point belongs to the work blocks.
+    expect(islam[0].start).toBe(d.prayers.maghrib - 2 * HOUR);
+    expect(islam[islam.length - 1].end).toBe(d.prayers.maghrib);
 
     expect(journal[0].start).toBe(d.prayers.maghrib + RULESET.prayerGaps.maghrib);
 
@@ -423,6 +445,25 @@ describe("resolveDay — the days worth eyeballing", () => {
     expect(afterIsha[afterIsha.length - 1].end).toBe(d.bedtime);
     // Over two hours of evening that would otherwise be a hole in the day.
     expect(spanMs(afterIsha)).toBeGreaterThan(2 * HOUR);
+  });
+
+  it("hands the surplus from the islamic-study cap to the work blocks", () => {
+    // Midsummer Asr→Maghrib is nearly three hours here. Capping it at two puts
+    // the rest back in front of the cap, where the morning sequence reaches it:
+    // work goes from roughly 4h08m each to 4h30m+, and the last work block runs
+    // right up to the moment islamic study opens.
+    const d = day("2026-06-15");
+    const window = d.prayers.maghrib - d.prayers.asr;
+    expect(window).toBeGreaterThan(2 * HOUR);
+
+    for (const id of ["deep-work", "projects"]) {
+      const c = d.compression.find((x) => x.id === id)!;
+      expect(c.actualMs).toBeGreaterThan(4.4 * HOUR);
+    }
+
+    const projects = d.blocks.filter((b) => b.title.startsWith("projects"));
+    const islamStart = d.prayers.maghrib - 2 * HOUR;
+    expect(projects[projects.length - 1].end).toBe(islamStart);
   });
 
   it("rotates the workout title with the weekday", () => {

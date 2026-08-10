@@ -151,11 +151,24 @@ that cache to within 1–2 minutes, which is nothing against 15-minute rules.
 
 ### Everything else is fitted around it
 
-Evening windows own their spans outright (Asr→Maghrib, Maghrib→**bedtime** — the
+Evening windows are anchored to prayers (Asr→Maghrib, Maghrib→**bedtime** — the
 latter matters in winter, where anchoring to Isha would leave two hours
 unassigned). Prayers are *carved out* of whatever block is running, so a block
 spanning Dhuhr is split by it rather than overlapping it — which is how
 "30 minutes after Dhuhr" falls out of the model instead of being a special case.
+
+**A capped window anchors to its end, not its start.** Islamic study is capped at
+2h and finishes at Maghrib, so in midsummer — when Asr→Maghrib runs to 3h28m —
+the surplus falls at the *front* of the window where the morning sequence can
+still reach it, and the work blocks go from 3h53m each to 4h30m. Anchored the
+other way, that surplus would be stranded between the block and the next prayer,
+belonging to nothing.
+
+The evening journal block is deliberately **not** capped. "No screens" is a rule
+about the evening rather than a task with a duration, and capping it would hand
+the remainder back to the work blocks — which is exactly the screen time it
+exists to prevent. In December that makes it over three hours; the readout shows
+how far past its nominal hour it runs.
 
 Waking to Asr is then divided between the morning blocks. **The targets total 25
 hours on purpose**, so every day gives something back: the workout is fixed and

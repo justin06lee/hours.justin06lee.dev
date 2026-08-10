@@ -270,16 +270,27 @@ export function resolveDay(
   }
   gaps.sort((a, b) => a.start - b.start);
 
-  // Evening windows. They own their spans, so they are removed from what the
+  // Evening windows. They own their spans, so those are removed from what the
   // morning sequence has to work with.
   const windowSpans: Span[] = [];
+  const windowCompression: Compression[] = [];
   for (const w of ruleset.windows) {
     const from = today[w.from];
     const to = w.to === "bedtime" ? bedtime : today[w.to];
-    const span = { start: Math.max(from, wake), end: Math.min(to, bedtime) };
+    let span = { start: Math.max(from, wake), end: Math.min(to, bedtime) };
     if (span.end <= span.start) continue;
+
+    // A capped window keeps its END and gives back the front, so the surplus
+    // lands where the morning sequence can still use it. Anchored the other way
+    // it would be stranded between this block and the next prayer.
+    if (w.maxMs !== undefined) {
+      const cappedStart = span.end - w.maxMs;
+      if (cappedStart > span.start) span = { start: cappedStart, end: span.end };
+    }
+
     windowSpans.push(span);
-    subtractSpans(span, gaps).forEach((piece, i) => {
+    const pieces = subtractSpans(span, gaps);
+    pieces.forEach((piece, i) => {
       blocks.push({
         key: key(w.id, i),
         kind: "activity",
@@ -289,6 +300,14 @@ export function resolveDay(
         end: piece.end,
       });
     });
+    if (w.targetMs !== undefined) {
+      windowCompression.push({
+        id: w.id,
+        title: w.title,
+        targetMs: w.targetMs,
+        actualMs: spanMs(pieces),
+      });
+    }
   }
 
   // The morning: waking until the first window opens, minus prayers.
@@ -326,6 +345,8 @@ export function resolveDay(
       actualMs: spanMs(taken.spans),
     });
   }
+  // Windows last, so the readout runs morning-then-evening like the day does.
+  compression.push(...windowCompression);
 
   // Tonight's sleep, and the tahajjud that interrupts it.
   tonight.segments.forEach((segment, i) => {

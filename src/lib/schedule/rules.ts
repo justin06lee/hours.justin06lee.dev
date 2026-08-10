@@ -32,6 +32,18 @@ export type WindowBlock = {
   from: PrayerName;
   /** Ends at this prayer, or at bedtime. */
   to: PrayerName | "bedtime";
+  /**
+   * Cap on how much of the window this block actually takes.
+   *
+   * A capped block **anchors to its end** rather than its start: it finishes at
+   * `to` and begins `maxMs` before that, so the surplus falls at the *front* of
+   * the window where the morning sequence can still reach it. Anchoring to the
+   * start instead would leave the surplus stranded between the block and the
+   * next prayer, belonging to nothing.
+   */
+  maxMs?: number;
+  /** What this block is nominally worth, for the target-vs-actual readout. */
+  targetMs?: number;
 };
 
 /**
@@ -130,6 +142,12 @@ export const RULESET: Ruleset = {
       title: "islamic history, hadith, quran",
       from: "asr",
       to: "maghrib",
+      // Two hours, ending at Maghrib. Asr to Maghrib runs to nearly three hours
+      // in midsummer, and the surplus is worth more to the work blocks than to
+      // a third hour here — so it sits at the front of the window, before this
+      // starts, where the morning sequence picks it up.
+      maxMs: 2 * HOUR,
+      targetMs: 2 * HOUR,
     },
     {
       id: "journal",
@@ -141,6 +159,13 @@ export const RULESET: Ruleset = {
       // this at Isha would leave it unassigned — over two hours of it in
       // December.
       to: "bedtime",
+      // Deliberately **not** capped, unlike the Islamic study above. This block
+      // is "no screens", which is a rule about the evening rather than a task
+      // with a duration — capping it would hand the remainder back to the work
+      // blocks, which is exactly the screen time it exists to prevent. In
+      // December that makes it over three hours. The target is here only so the
+      // readout shows how far past the nominal hour it runs.
+      targetMs: 1 * HOUR,
     },
   ],
 
