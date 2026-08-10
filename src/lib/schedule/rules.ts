@@ -20,8 +20,12 @@ const HOUR = 60 * MINUTE;
 
 /**
  * A block that owns a span between two anchors, whatever length that turns out
- * to be. Used for the evening, where the prayer-to-prayer windows *are* the
- * intended durations — Asr to Maghrib is however long Asr to Maghrib is.
+ * to be — including none at all.
+ *
+ * Only the post-Isha wind-down uses this now. Everything with a duration it
+ * cares about belongs in the sequence, where a duration is what it gets; a
+ * window is for the opposite case, a stretch of time that has to belong to
+ * something whether it is two hours long or empty.
  */
 export type WindowBlock = {
   id: string;
@@ -32,16 +36,6 @@ export type WindowBlock = {
   from: PrayerName;
   /** Ends at this prayer, or at bedtime. */
   to: PrayerName | "bedtime";
-  /**
-   * Cap on how much of the window this block actually takes.
-   *
-   * A capped block **anchors to its end** rather than its start: it finishes at
-   * `to` and begins `maxMs` before that, so the surplus falls at the *front* of
-   * the window where the morning sequence can still reach it. Anchoring to the
-   * start instead would leave the surplus stranded between the block and the
-   * next prayer, belonging to nothing.
-   */
-  maxMs?: number;
   /** What this block is nominally worth, for the target-vs-actual readout. */
   targetMs?: number;
 };
@@ -137,38 +131,34 @@ export const RULESET: Ruleset = {
 
   windows: [
     {
-      id: "islam",
-      category: "Islam",
-      title: "islamic history, hadith, quran",
-      from: "asr",
-      to: "maghrib",
-      // Two hours, ending at Maghrib. Asr to Maghrib runs to nearly three hours
-      // in midsummer, and the surplus is worth more to the work blocks than to
-      // a third hour here — so it sits at the front of the window, before this
-      // starts, where the morning sequence picks it up.
-      maxMs: 2 * HOUR,
-      targetMs: 2 * HOUR,
-    },
-    {
-      id: "journal",
+      id: "wind-down",
       category: "Journal",
-      title: "no screens, journal",
-      from: "maghrib",
-      // To bedtime rather than to Isha. With the floor in play there is a
-      // stretch after Isha that belongs to the evening wind-down, and ending
-      // this at Isha would leave it unassigned — over two hours of it in
-      // December.
+      title: "no screens",
+      // The tail between praying Isha and actually going to bed. Zero-length
+      // most of the year, because bedtime is Isha + 15m and the prayer fills
+      // exactly that — but in December the 20:30 floor holds bedtime more than
+      // two hours after Isha, and that stretch is still the evening. Screens
+      // stay off through it, so it carries the same title as the block before.
+      from: "isha",
       to: "bedtime",
-      // Deliberately **not** capped, unlike the Islamic study above. This block
-      // is "no screens", which is a rule about the evening rather than a task
-      // with a duration — capping it would hand the remainder back to the work
-      // blocks, which is exactly the screen time it exists to prevent. In
-      // December that makes it over three hours. The target is here only so the
-      // readout shows how far past the nominal hour it runs.
-      targetMs: 1 * HOUR,
     },
   ],
 
+  /**
+   * The whole waking day, in order, from waking to Isha.
+   *
+   * The evening is part of this sequence rather than anchored to prayer windows
+   * because it no longer fits in one. Journaling and no-screens want an hour
+   * each, and Maghrib to Isha is between 1h17m and 1h31m all year here — two
+   * hours of evening has to begin before Maghrib, which means Islamic study
+   * cannot also end at Maghrib. So the evening chains backwards from Isha
+   * instead: no-screens is the hour before it, journaling the hour before that,
+   * and Islamic study sits immediately before them.
+   *
+   * Fixed blocks are paid first and in full; the two elastic work blocks share
+   * whatever is left. Adding two hours of fixed evening therefore comes
+   * straight out of them, which is the intended trade.
+   */
   sequence: [
     {
       id: "deep-work",
@@ -194,6 +184,27 @@ export const RULESET: Ruleset = {
       targetMs: 6 * HOUR,
       elastic: true,
       minMs: 90 * MINUTE,
+    },
+    {
+      id: "islam",
+      category: "Islam",
+      title: "islamic history, hadith, quran",
+      targetMs: 2 * HOUR,
+      elastic: false,
+    },
+    {
+      id: "journal",
+      category: "Journal",
+      title: "journal",
+      targetMs: 1 * HOUR,
+      elastic: false,
+    },
+    {
+      id: "no-screens",
+      category: "Journal",
+      title: "no screens",
+      targetMs: 1 * HOUR,
+      elastic: false,
     },
   ],
 };

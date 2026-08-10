@@ -151,31 +151,32 @@ that cache to within 1–2 minutes, which is nothing against 15-minute rules.
 
 ### Everything else is fitted around it
 
-Evening windows are anchored to prayers (Asr→Maghrib, Maghrib→**bedtime** — the
-latter matters in winter, where anchoring to Isha would leave two hours
-unassigned). Prayers are *carved out* of whatever block is running, so a block
-spanning Dhuhr is split by it rather than overlapping it — which is how
-"30 minutes after Dhuhr" falls out of the model instead of being a special case.
+Prayers are *carved out* of whatever block is running, so a block spanning Dhuhr
+is split by it rather than overlapping it — which is how "30 minutes after Dhuhr"
+falls out of the model instead of being a special case. Blocks are laid out in
+**activity time**, so a prayer landing mid-block splits it rather than eating
+into it: journalling is a full hour on a day when Maghrib falls in the middle of
+it, not 45 minutes.
 
-**A capped window anchors to its end, not its start.** Islamic study is capped at
-2h and finishes at Maghrib, so in midsummer — when Asr→Maghrib runs to 3h28m —
-the surplus falls at the *front* of the window where the morning sequence can
-still reach it, and the work blocks go from 3h53m each to 4h30m. Anchored the
-other way, that surplus would be stranded between the block and the next prayer,
-belonging to nothing.
+**The evening chains backwards from Isha**: no-screens is the hour ending at
+Isha, journalling the hour before that, Islamic study the two hours before that.
+It has to work that way rather than from prayer windows, because Maghrib to Isha
+is only 1h17m–1h31m all year here — two hours of evening necessarily begins
+before Maghrib, so Islamic study cannot also end at Maghrib. It sits immediately
+before journalling instead, which in December means it starts a little before
+Asr.
 
-The evening journal block is deliberately **not** capped. "No screens" is a rule
-about the evening rather than a task with a duration, and capping it would hand
-the remainder back to the work blocks — which is exactly the screen time it
-exists to prevent. In December that makes it over three hours; the readout shows
-how far past its nominal hour it runs.
+The one genuine window left is the stretch between praying Isha and actually
+going to bed. It is zero-length for most of the year, because bedtime is Isha +
+15m and the prayer fills exactly that — but in December the 20:30 floor holds
+bedtime over two hours after Isha, and screens stay off through it.
 
-Waking to Asr is then divided between the morning blocks. **The targets total 25
-hours on purpose**, so every day gives something back: the workout is fixed and
-the two six-hour work blocks are elastic, absorbing the entire shortfall. In
-practice they land near 4h each rather than 6h, which is why `/track/schedule`
-prints target against realised — the compression should be visible, not
-discovered from a total that looks wrong months later.
+Everything except the two work blocks is **fixed**: the workout, Islamic study,
+journalling and no-screens all get their target every single day. The targets
+total 25 hours on purpose, so the shortfall comes entirely out of the elastic
+pair — about 4h05m each in summer and 3h12m in December, against a 6h target.
+That is why `/track/schedule` prints target against realised: the compression
+should be visible, not discovered from a total that looks wrong months later.
 
 The engine is pure: given prayer times and a ruleset it returns the same day
 every time, with no clock, database or environment involved. That is what lets

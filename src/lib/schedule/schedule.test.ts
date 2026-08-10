@@ -85,7 +85,16 @@ describe("subtractSpans", () => {
 /* ── the compression math ─────────────────────────────────────────────── */
 
 describe("allocate", () => {
-  const blocks = RULESET.sequence;
+  /**
+   * A local fixture rather than `RULESET.sequence`. These tests are about the
+   * allocator, and pinning them to the live ruleset meant every change to the
+   * schedule broke tests that had nothing to do with it.
+   */
+  const blocks = [
+    { id: "deep-work", category: "x", title: "deep work", targetMs: 6 * HOUR, elastic: true },
+    { id: "workout", category: "x", title: "workout", targetMs: 1 * HOUR, elastic: false },
+    { id: "projects", category: "x", title: "projects", targetMs: 6 * HOUR, elastic: true },
+  ];
 
   it("pays fixed blocks in full and splits the rest by target", () => {
     // 13h of targets (6 + 1 + 6) into 13h: everyone gets what they asked for.
@@ -345,17 +354,32 @@ describe("resolveDay — invariants that must hold on every day of the year", ()
     }
   });
 
-  it("never gives islamic study more than its two-hour cap, and ends it at maghrib", () => {
+  it("gives every fixed block exactly its target, every day", () => {
+    // Islamic study, journaling, no-screens and the workout are all fixed now,
+    // so the sun never shortens any of them — it shortens the work blocks.
     for (const date of dates) {
       const d = day(date);
-      const islam = d.compression.find((c) => c.id === "islam")!;
-      expect(islam.actualMs, `${date}`).toBeLessThanOrEqual(2 * HOUR);
+      for (const [id, want] of [
+        ["workout", 1 * HOUR],
+        ["islam", 2 * HOUR],
+        ["journal", 1 * HOUR],
+        ["no-screens", 1 * HOUR],
+      ] as const) {
+        const c = d.compression.find((x) => x.id === id)!;
+        expect(c.actualMs, `${date}: ${id}`).toBe(want);
+      }
+    }
+  });
 
-      const blocks = d.blocks.filter((b) => b.title === "islamic history, hadith, quran");
-      expect(blocks.length, `${date}`).toBeGreaterThan(0);
-      expect(blocks[blocks.length - 1].end, `${date}: ends at maghrib`).toBe(
-        d.prayers.maghrib,
-      );
+  it("ends the waking sequence exactly at Isha", () => {
+    // The evening chains backwards from Isha: no-screens is the last hour
+    // before it. Everything after is the prayer itself and the wind-down.
+    for (const date of dates) {
+      const d = day(date);
+      const noScreens = d.blocks.filter((b) => b.title === "no screens");
+      const beforeIsha = noScreens.filter((b) => b.end <= d.prayers.isha);
+      expect(beforeIsha.length, `${date}`).toBeGreaterThan(0);
+      expect(beforeIsha[beforeIsha.length - 1].end, `${date}`).toBe(d.prayers.isha);
     }
   });
 
@@ -411,59 +435,64 @@ describe("resolveDay — the days worth eyeballing", () => {
     expect(at(d.wake)).toBe("04:30");
   });
 
-  it("puts the evening where the rules say", () => {
+  it("orders the evening backwards from Isha: study, journal, no screens", () => {
     const d = day("2026-06-15");
     const islam = d.blocks.filter((b) => b.title === "islamic history, hadith, quran");
-    const journal = d.blocks.filter((b) => b.title === "no screens, journal");
+    const journal = d.blocks.filter((b) => b.title === "journal");
+    const noScreens = d.blocks.filter((b) => b.title === "no screens");
+
     expect(islam.length).toBeGreaterThan(0);
     expect(journal.length).toBeGreaterThan(0);
-    // Capped at two hours and anchored to Maghrib, so it opens two hours before
-    // Maghrib rather than the moment Asr has been prayed. The stretch between
-    // Asr and that point belongs to the work blocks.
-    expect(islam[0].start).toBe(d.prayers.maghrib - 2 * HOUR);
-    expect(islam[islam.length - 1].end).toBe(d.prayers.maghrib);
+    expect(noScreens.length).toBeGreaterThan(0);
 
-    expect(journal[0].start).toBe(d.prayers.maghrib + RULESET.prayerGaps.maghrib);
-
-    // In June, Isha is 22:01 and bedtime 22:16 — the prayer fills the last
-    // quarter hour, so the evening legitimately ends on it.
-    const waking = d.blocks.filter((b) => b.kind === "activity" || b.kind === "prayer");
-    expect(waking[waking.length - 1].end).toBe(d.bedtime);
+    // no screens is the hour ending at Isha; journaling the hour before that;
+    // islamic study the two hours before that.
+    expect(noScreens[noScreens.length - 1].end).toBe(d.prayers.isha);
+    expect(journal[journal.length - 1].end).toBe(noScreens[0].start);
+    expect(islam[islam.length - 1].end).toBe(journal[0].start);
   });
 
-  it("carries the evening past Isha to bedtime, which is why winter has an evening at all", () => {
-    // The `to: "bedtime"` anchor only earns its keep in winter. On 2026-12-15
-    // Isha is 18:09 and the floor holds bedtime at 20:30 — anchoring the
-    // journal to Isha instead would leave the last two hours and change of the
-    // day unassigned entirely.
-    const d = day("2026-12-15");
-    const journal = d.blocks.filter((b) => b.title === "no screens, journal");
-
-    expect(journal.length).toBeGreaterThan(1);
-    const afterIsha = journal.filter((b) => b.start >= d.prayers.isha);
-    expect(afterIsha.length).toBeGreaterThan(0);
-    expect(afterIsha[afterIsha.length - 1].end).toBe(d.bedtime);
-    // Over two hours of evening that would otherwise be a hole in the day.
-    expect(spanMs(afterIsha)).toBeGreaterThan(2 * HOUR);
+  it("keeps journalling a full hour even when Maghrib lands inside it", () => {
+    // The evening chain is laid out in *activity* time, so a prayer falling in
+    // the middle of a block splits it rather than eating into it. Without that,
+    // "journal for an hour" would quietly be 45 minutes on any day where
+    // Maghrib happened to land there.
+    for (const date of ["2026-06-15", "2026-08-09", "2026-12-15", "2026-03-08"]) {
+      const d = day(date);
+      const journal = d.compression.find((c) => c.id === "journal")!;
+      expect(journal.actualMs, date).toBe(1 * HOUR);
+    }
   });
 
-  it("hands the surplus from the islamic-study cap to the work blocks", () => {
-    // Midsummer Asr→Maghrib is nearly three hours here. Capping it at two puts
-    // the rest back in front of the cap, where the morning sequence reaches it:
-    // work goes from roughly 4h08m each to 4h30m+, and the last work block runs
-    // right up to the moment islamic study opens.
+  it("gives the post-Isha stretch to the wind-down in winter, and skips it in summer", () => {
+    // In December the 20:30 floor holds bedtime more than two hours after Isha,
+    // and that stretch still belongs to the evening.
+    const winter = day("2026-12-15");
+    const windDown = winter.blocks.filter(
+      (b) => b.title === "no screens" && b.start >= winter.prayers.isha,
+    );
+    expect(windDown.length).toBeGreaterThan(0);
+    expect(windDown[windDown.length - 1].end).toBe(winter.bedtime);
+    expect(spanMs(windDown)).toBeGreaterThan(2 * HOUR);
+
+    // In summer bedtime is Isha + 15m and the prayer fills exactly that, so
+    // there is no wind-down at all — an empty window, not a missing one.
+    const summer = day("2026-06-15");
+    const after = summer.blocks.filter(
+      (b) => b.title === "no screens" && b.start >= summer.prayers.isha,
+    );
+    expect(after).toHaveLength(0);
+  });
+
+  it("takes the two hours of fixed evening out of the work blocks", () => {
+    // "Reduce from the largest time takers": the evening is fixed, so adding to
+    // it can only come from the elastic pair.
     const d = day("2026-06-15");
-    const window = d.prayers.maghrib - d.prayers.asr;
-    expect(window).toBeGreaterThan(2 * HOUR);
-
     for (const id of ["deep-work", "projects"]) {
       const c = d.compression.find((x) => x.id === id)!;
-      expect(c.actualMs).toBeGreaterThan(4.4 * HOUR);
+      expect(c.actualMs).toBeLessThan(c.targetMs);
+      expect(c.actualMs).toBeGreaterThanOrEqual(90 * MIN);
     }
-
-    const projects = d.blocks.filter((b) => b.title.startsWith("projects"));
-    const islamStart = d.prayers.maghrib - 2 * HOUR;
-    expect(projects[projects.length - 1].end).toBe(islamStart);
   });
 
   it("rotates the workout title with the weekday", () => {

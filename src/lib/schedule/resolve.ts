@@ -277,16 +277,11 @@ export function resolveDay(
   for (const w of ruleset.windows) {
     const from = today[w.from];
     const to = w.to === "bedtime" ? bedtime : today[w.to];
-    let span = { start: Math.max(from, wake), end: Math.min(to, bedtime) };
+    const span = { start: Math.max(from, wake), end: Math.min(to, bedtime) };
+    // Empty is normal, not exceptional: the wind-down window is zero-length for
+    // most of the year, because bedtime is Isha + 15m and the Isha prayer fills
+    // exactly that.
     if (span.end <= span.start) continue;
-
-    // A capped window keeps its END and gives back the front, so the surplus
-    // lands where the morning sequence can still use it. Anchored the other way
-    // it would be stranded between this block and the next prayer.
-    if (w.maxMs !== undefined) {
-      const cappedStart = span.end - w.maxMs;
-      if (cappedStart > span.start) span = { start: cappedStart, end: span.end };
-    }
 
     windowSpans.push(span);
     const pieces = subtractSpans(span, gaps);
