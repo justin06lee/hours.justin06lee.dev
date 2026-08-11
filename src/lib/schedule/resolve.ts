@@ -9,12 +9,13 @@
  *      through Dhuhr is split by it rather than overlapping it, which is what
  *      makes "30 minutes after Dhuhr" fall out of the model instead of being
  *      a special case.
- *   3. **Evening windows are placed**, owning Asr→Maghrib and Maghrib→bedtime
- *      outright. They take whatever those spans are worth, so they never
- *      compete for time.
- *   4. **The morning sequence absorbs the rest.** Waking to Asr, minus the
- *      workout and the prayer gaps, is divided between the two long work
- *      blocks in proportion to their targets.
+ *   3. **One sequence fills waking to bedtime.** Fixed blocks — the workout,
+ *      Islamic study, journalling, no-screens — are paid in full; the two long
+ *      work blocks share whatever the prayers and the fixed blocks leave, in
+ *      proportion to their targets.
+ *
+ * Anchoring the end at bedtime rather than at Isha is what keeps the work
+ * blocks steady across a year in which Isha itself swings four hours.
  *
  * Pure: given prayer times and a ruleset it returns the same day every time,
  * with no clock, database or environment involved. That is what makes it
@@ -270,47 +271,17 @@ export function resolveDay(
   }
   gaps.sort((a, b) => a.start - b.start);
 
-  // Evening windows. They own their spans, so those are removed from what the
-  // morning sequence has to work with.
-  const windowSpans: Span[] = [];
-  const windowCompression: Compression[] = [];
-  for (const w of ruleset.windows) {
-    const from = today[w.from];
-    const to = w.to === "bedtime" ? bedtime : today[w.to];
-    const span = { start: Math.max(from, wake), end: Math.min(to, bedtime) };
-    // Empty is normal, not exceptional: the wind-down window is zero-length for
-    // most of the year, because bedtime is Isha + 15m and the Isha prayer fills
-    // exactly that.
-    if (span.end <= span.start) continue;
-
-    windowSpans.push(span);
-    const pieces = subtractSpans(span, gaps);
-    pieces.forEach((piece, i) => {
-      blocks.push({
-        key: key(w.id, i),
-        kind: "activity",
-        category: w.category,
-        title: w.title,
-        start: piece.start,
-        end: piece.end,
-      });
-    });
-    if (w.targetMs !== undefined) {
-      windowCompression.push({
-        id: w.id,
-        title: w.title,
-        targetMs: w.targetMs,
-        actualMs: spanMs(pieces),
-      });
-    }
-  }
-
-  // The morning: waking until the first window opens, minus prayers.
-  const firstWindow = windowSpans.reduce(
-    (earliest, s) => Math.min(earliest, s.start),
-    bedtime,
-  );
-  const morning = { start: wake, end: Math.max(wake, firstWindow) };
+  // The waking day is one run from waking to bedtime.
+  //
+  // Anchoring the end at **bedtime** rather than at Isha is what keeps the work
+  // blocks steady across the year. Isha swings by nearly four hours here, so
+  // ending the sequence there handed December's early Isha a dead two-hour
+  // stretch before the 20:30 floor let sleep begin — time that belonged to
+  // nothing and came straight out of the only blocks that flex. Bedtime is
+  // already `max(Isha + 15m, floor)`, so in summer this *is* Isha (the Isha
+  // prayer fills the final quarter hour and the last block still ends on it),
+  // and in winter it reaches the floor and reclaims the gap.
+  const morning = { start: wake, end: Math.max(wake, bedtime) };
   const available = subtractSpans(morning, gaps);
   const durations = allocate(ruleset.sequence, spanMs(available));
 
@@ -340,8 +311,6 @@ export function resolveDay(
       actualMs: spanMs(taken.spans),
     });
   }
-  // Windows last, so the readout runs morning-then-evening like the day does.
-  compression.push(...windowCompression);
 
   // Tonight's sleep, and the tahajjud that interrupts it.
   tonight.segments.forEach((segment, i) => {

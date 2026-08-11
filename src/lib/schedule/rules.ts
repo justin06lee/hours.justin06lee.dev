@@ -19,29 +19,7 @@ const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 
 /**
- * A block that owns a span between two anchors, whatever length that turns out
- * to be — including none at all.
- *
- * Only the post-Isha wind-down uses this now. Everything with a duration it
- * cares about belongs in the sequence, where a duration is what it gets; a
- * window is for the opposite case, a stretch of time that has to belong to
- * something whether it is two hours long or empty.
- */
-export type WindowBlock = {
-  id: string;
-  /** Category name, resolved against `calendar_categories` at materialisation. */
-  category: string;
-  title: string;
-  /** Starts when this prayer's gap ends. */
-  from: PrayerName;
-  /** Ends at this prayer, or at bedtime. */
-  to: PrayerName | "bedtime";
-  /** What this block is nominally worth, for the target-vs-actual readout. */
-  targetMs?: number;
-};
-
-/**
- * A block in the run from waking to Asr, placed in order.
+ * A block in the run from waking to bedtime, placed in order.
  *
  * `elastic` is the whole compression story. The targets below add up to more
  * hours than any day has, so something must give every single day — and the
@@ -70,8 +48,6 @@ export type Ruleset = {
    * than overlapping it.
    */
   prayerGaps: Record<PrayerName, number>;
-  /** Placed first; they own their spans outright. */
-  windows: WindowBlock[];
   /** Fills waking to Asr, in this order. */
   sequence: SequenceBlock[];
 };
@@ -129,31 +105,21 @@ export const RULESET: Ruleset = {
     isha: 15 * MINUTE,
   },
 
-  windows: [
-    {
-      id: "wind-down",
-      category: "Journal",
-      title: "no screens",
-      // The tail between praying Isha and actually going to bed. Zero-length
-      // most of the year, because bedtime is Isha + 15m and the prayer fills
-      // exactly that — but in December the 20:30 floor holds bedtime more than
-      // two hours after Isha, and that stretch is still the evening. Screens
-      // stay off through it, so it carries the same title as the block before.
-      from: "isha",
-      to: "bedtime",
-    },
-  ],
-
   /**
-   * The whole waking day, in order, from waking to Isha.
+   * The whole waking day, in order, from waking to bedtime.
    *
    * The evening is part of this sequence rather than anchored to prayer windows
    * because it no longer fits in one. Journaling and no-screens want an hour
    * each, and Maghrib to Isha is between 1h17m and 1h31m all year here — two
    * hours of evening has to begin before Maghrib, which means Islamic study
-   * cannot also end at Maghrib. So the evening chains backwards from Isha
-   * instead: no-screens is the hour before it, journaling the hour before that,
-   * and Islamic study sits immediately before them.
+   * cannot also end at Maghrib. So the evening chains backwards from the end of
+   * the day: no-screens last, journaling before it, Islamic study before that.
+   *
+   * That end is **bedtime**, not Isha. Bedtime is `max(Isha + 15m, 20:30)`, so
+   * for most of the year it *is* Isha — the Isha prayer fills the final quarter
+   * hour and no-screens still ends on it. In December, when Isha is 18:09 and
+   * the floor holds bedtime at 20:30, it reaches the floor instead and the two
+   * hours between them go to the day rather than to nothing.
    *
    * Fixed blocks are paid first and in full; the two elastic work blocks share
    * whatever is left. Adding two hours of fixed evening therefore comes

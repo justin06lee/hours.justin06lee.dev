@@ -371,15 +371,21 @@ describe("resolveDay — invariants that must hold on every day of the year", ()
     }
   });
 
-  it("ends the waking sequence exactly at Isha", () => {
-    // The evening chains backwards from Isha: no-screens is the last hour
-    // before it. Everything after is the prayer itself and the wind-down.
+  it("ends the waking sequence exactly at bedtime", () => {
+    // The evening chains backwards from bedtime, not Isha. For most of the year
+    // those are the same thing — the Isha prayer fills the final quarter hour —
+    // but in winter the 20:30 floor sits hours after Isha, and that stretch
+    // belongs to the day rather than to nothing.
     for (const date of dates) {
       const d = day(date);
-      const noScreens = d.blocks.filter((b) => b.title === "no screens");
-      const beforeIsha = noScreens.filter((b) => b.end <= d.prayers.isha);
-      expect(beforeIsha.length, `${date}`).toBeGreaterThan(0);
-      expect(beforeIsha[beforeIsha.length - 1].end, `${date}`).toBe(d.prayers.isha);
+      const activities = d.blocks.filter((b) => b.kind === "activity");
+      expect(activities.length, `${date}`).toBeGreaterThan(0);
+      // No-screens is always the last *activity*. Whether it also touches
+      // bedtime depends on where the Isha prayer falls: for most of the year
+      // Isha + 15m reaches bedtime exactly, so the final block of the day is
+      // the prayer. The full-coverage invariant above is what guarantees there
+      // is no hole either way.
+      expect(activities[activities.length - 1].title, `${date}`).toBe("no screens");
     }
   });
 
@@ -464,35 +470,48 @@ describe("resolveDay — the days worth eyeballing", () => {
     }
   });
 
-  it("gives the post-Isha stretch to the wind-down in winter, and skips it in summer", () => {
-    // In December the 20:30 floor holds bedtime more than two hours after Isha,
-    // and that stretch still belongs to the evening.
-    const winter = day("2026-12-15");
-    const windDown = winter.blocks.filter(
-      (b) => b.title === "no screens" && b.start >= winter.prayers.isha,
-    );
-    expect(windDown.length).toBeGreaterThan(0);
-    expect(windDown[windDown.length - 1].end).toBe(winter.bedtime);
-    expect(spanMs(windDown)).toBeGreaterThan(2 * HOUR);
+  it("reclaims the winter gap between Isha and the bedtime floor", () => {
+    // December's Isha is 18:09 and the floor holds bedtime at 20:30. Anchoring
+    // the sequence to Isha left those two hours and change owned by nothing and
+    // took them out of the work blocks; anchored to bedtime the day runs
+    // through them, and the work blocks go from 3h12m each to 4h15m.
+    const d = day("2026-12-15");
+    expect(at(d.prayers.isha)).toBe("18:09");
+    expect(at(d.bedtime)).toBe("20:30");
 
-    // In summer bedtime is Isha + 15m and the prayer fills exactly that, so
-    // there is no wind-down at all — an empty window, not a missing one.
-    const summer = day("2026-06-15");
-    const after = summer.blocks.filter(
-      (b) => b.title === "no screens" && b.start >= summer.prayers.isha,
+    const afterIsha = d.blocks.filter(
+      (b) => b.kind === "activity" && b.start >= d.prayers.isha,
     );
-    expect(after).toHaveLength(0);
-  });
+    expect(spanMs(afterIsha)).toBeGreaterThan(2 * HOUR);
 
-  it("takes the two hours of fixed evening out of the work blocks", () => {
-    // "Reduce from the largest time takers": the evening is fixed, so adding to
-    // it can only come from the elastic pair.
-    const d = day("2026-06-15");
     for (const id of ["deep-work", "projects"]) {
       const c = d.compression.find((x) => x.id === id)!;
-      expect(c.actualMs).toBeLessThan(c.targetMs);
-      expect(c.actualMs).toBeGreaterThanOrEqual(90 * MIN);
+      expect(c.actualMs).toBeGreaterThan(4 * HOUR);
     }
+  });
+
+  it("keeps the work blocks within a narrow band all year", () => {
+    // The point of anchoring to bedtime. Isha swings nearly four hours across
+    // the year; the work total must not follow it.
+    const sample: number[] = [];
+    for (let i = 0; i < 365; i += 3) {
+      const d = day(addDays("2026-01-01", i));
+      sample.push(
+        d.compression
+          .filter((c) => c.id === "deep-work" || c.id === "projects")
+          .reduce((sum, c) => sum + c.actualMs, 0),
+      );
+    }
+
+    const min = Math.min(...sample);
+    const max = Math.max(...sample);
+    // The extremes are the two DST days, which are genuinely 23 and 25 hours.
+    expect(min).toBeGreaterThanOrEqual(7.5 * HOUR);
+    expect(max).toBeLessThanOrEqual(9.75 * HOUR);
+
+    // Ordinary days cluster far more tightly than that.
+    const tight = sample.filter((t) => t >= 8 * HOUR && t <= 9 * HOUR);
+    expect(tight.length / sample.length).toBeGreaterThan(0.9);
   });
 
   it("rotates the workout title with the weekday", () => {

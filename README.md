@@ -158,25 +158,35 @@ falls out of the model instead of being a special case. Blocks are laid out in
 into it: journalling is a full hour on a day when Maghrib falls in the middle of
 it, not 45 minutes.
 
-**The evening chains backwards from Isha**: no-screens is the hour ending at
-Isha, journalling the hour before that, Islamic study the two hours before that.
-It has to work that way rather than from prayer windows, because Maghrib to Isha
-is only 1h17m–1h31m all year here — two hours of evening necessarily begins
-before Maghrib, so Islamic study cannot also end at Maghrib. It sits immediately
-before journalling instead, which in December means it starts a little before
-Asr.
+The whole waking day is one sequence, wake to bedtime, and **bedtime is the
+anchor rather than Isha**. That single choice is what keeps the work steady.
+Isha swings from 18:09 to 22:01 across the year here; anchoring the evening to
+it handed December a dead two-hour stretch between Isha and the 20:30 sleep
+floor — time owned by nothing, taken straight out of the only blocks that flex.
+Because bedtime is `max(Isha + 15m, 20:30)`, anchoring there *is* Isha for most
+of the year (the Isha prayer fills the final quarter hour and no-screens still
+ends on it) and reaches the floor in winter, giving those hours back.
 
-The one genuine window left is the stretch between praying Isha and actually
-going to bed. It is zero-length for most of the year, because bedtime is Isha +
-15m and the prayer fills exactly that — but in December the 20:30 floor holds
-bedtime over two hours after Isha, and screens stay off through it.
+The evening chains backwards from that end: no-screens last, journalling before
+it, Islamic study before that. It cannot be anchored to prayer windows, because
+Maghrib to Isha is only 1h17m–1h31m all year — two hours of evening necessarily
+begins before Maghrib, so Islamic study cannot also end at Maghrib.
 
-Everything except the two work blocks is **fixed**: the workout, Islamic study,
-journalling and no-screens all get their target every single day. The targets
-total 25 hours on purpose, so the shortfall comes entirely out of the elastic
-pair — about 4h05m each in summer and 3h12m in December, against a 6h target.
-That is why `/track/schedule` prints target against realised: the compression
-should be visible, not discovered from a total that looks wrong months later.
+Everything except the two work blocks is **fixed** and gets its target every
+single day. The targets total 25 hours on purpose, so the shortfall lands
+entirely on the elastic pair — and thanks to the bedtime anchor it lands
+*evenly*:
+
+| | per work block |
+| --- | --- |
+| median day | **4h15m** |
+| ordinary range | 4h07m – 4h15m |
+| whole-year range | 3h55m – 4h45m |
+
+The two outliers are the DST transitions, which are genuinely 23- and 25-hour
+days. Over 90% of the year sits within half an hour of the median. That is why
+`/track/schedule` prints target against realised — the compression should be
+visible, not discovered from a total that looks wrong months later.
 
 The engine is pure: given prayer times and a ruleset it returns the same day
 every time, with no clock, database or environment involved. That is what lets
